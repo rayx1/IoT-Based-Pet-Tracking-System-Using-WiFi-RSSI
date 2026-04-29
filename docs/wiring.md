@@ -16,3 +16,13 @@
 - Keep grounds common between the NodeMCU and buzzer module.
 - If the pet node is battery powered, re-check WiFi strength because supply voltage can affect radio performance.
 
+## Optional Battery Reading
+
+The Pet Node sketch includes an ADC battery-reading option, disabled by default.
+
+| Pet Node Pin | Connect To | Notes |
+| --- | --- | --- |
+| `A0` | Resistor divider output | Keep voltage within your NodeMCU A0 limit |
+| `GND` | Battery negative | Shared ground |
+
+Use a proper resistor divider and confirm your NodeMCU board's A0 input range before enabling `USE_ADC_BATTERY_READING`.

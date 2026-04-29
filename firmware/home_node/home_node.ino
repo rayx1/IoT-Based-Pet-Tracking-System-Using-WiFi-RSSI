@@ -7,29 +7,74 @@ extern "C" {
   #include <user_interface.h>
 }
 
+// Optional local credentials/config file.
+// Copy secrets.example.h to secrets.h, edit it, and keep secrets.h out of Git.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+
 // =========================
 // User configuration
-// Edit these placeholders before uploading.
+// Edit these placeholders, or define the same names in secrets.h.
 // =========================
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#ifndef WIFI_SSID_VALUE
+#define WIFI_SSID_VALUE "YOUR_WIFI_SSID"
+#endif
 
-const char *SMTP_HOST = "smtp.example.com";
-const int SMTP_PORT = 465;
-const char *SENDER_EMAIL = "sender@example.com";
-const char *SENDER_APP_PASSWORD = "YOUR_APP_PASSWORD";
-const char *RECIPIENT_EMAIL = "recipient@example.com";
+#ifndef WIFI_PASSWORD_VALUE
+#define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
+#endif
+
+#ifndef SMTP_HOST_VALUE
+#define SMTP_HOST_VALUE "smtp.example.com"
+#endif
+
+#ifndef SMTP_PORT_VALUE
+#define SMTP_PORT_VALUE 465
+#endif
+
+#ifndef SENDER_EMAIL_VALUE
+#define SENDER_EMAIL_VALUE "sender@example.com"
+#endif
+
+#ifndef SENDER_APP_PASSWORD_VALUE
+#define SENDER_APP_PASSWORD_VALUE "YOUR_APP_PASSWORD"
+#endif
+
+#ifndef RECIPIENT_EMAIL_VALUE
+#define RECIPIENT_EMAIL_VALUE "recipient@example.com"
+#endif
+
+#ifndef PET_NODE_MAC_BYTES
+// Replace this with the MAC printed by the Pet Node sketch.
+#define PET_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}
+#endif
+
+const char *WIFI_SSID = WIFI_SSID_VALUE;
+const char *WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
+const char *SMTP_HOST = SMTP_HOST_VALUE;
+const int SMTP_PORT = SMTP_PORT_VALUE;
+const char *SENDER_EMAIL = SENDER_EMAIL_VALUE;
+const char *SENDER_APP_PASSWORD = SENDER_APP_PASSWORD_VALUE;
+const char *RECIPIENT_EMAIL = RECIPIENT_EMAIL_VALUE;
+uint8_t PET_NODE_MAC[] = PET_NODE_MAC_BYTES;
+
+const uint32_t PACKET_MAGIC = 0x50544731; // "PTG1"
+const uint8_t PROTOCOL_VERSION = 1;
 
 const int RSSI_THRESHOLD_DBM = -75;
 const unsigned long PACKET_TIMEOUT_MS = 10000;
 const unsigned long EMAIL_COOLDOWN_MS = 300000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
+const unsigned long BUZZER_SILENCE_MS = 120000;
 
 const uint8_t BUZZER_PIN = D5;
 const char *EXPECTED_PET_ID = "PET-001";
 
 // Keep this struct identical to the pet node.
 struct PetPacket {
+  uint32_t magic;
+  uint8_t protocolVersion;
   char petId[16];
   uint32_t packetCounter;
   float batteryVoltage;
@@ -53,22 +98,27 @@ PetPacket lastPacket;
 bool packetReceived = false;
 bool espNowReady = false;
 bool wifiReady = false;
-bool buzzerOn = false;
+bool buzzerOutputHigh = false;
 bool alertConditionActive = false;
 bool emailConfigured = true;
 
 unsigned long lastPacketAtMs = 0;
 unsigned long lastStatusLogAtMs = 0;
 unsigned long lastEmailSentAtMs = 0;
+unsigned long lastBuzzerToggleAtMs = 0;
+unsigned long buzzerSilencedUntilMs = 0;
 uint8_t wifiChannel = 0;
 String homeIpString = "0.0.0.0";
-String lastStatus = "Waiting";
 
 String formatMac(const uint8_t *mac) {
   char buffer[18];
   snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   return String(buffer);
+}
+
+bool macEquals(const uint8_t *left, const uint8_t *right) {
+  return memcmp(left, right, 6) == 0;
 }
 
 void smtpCallback(SMTP_Status status) {
@@ -116,21 +166,28 @@ bool connectToWifi() {
   Serial.println(homeIpString);
   Serial.print("Home Node MAC: ");
   Serial.println(WiFi.macAddress());
+  Serial.print("Expected Pet Node MAC: ");
+  Serial.println(formatMac(PET_NODE_MAC));
   Serial.print("Home Node WiFi channel: ");
   Serial.println(wifiChannel);
   return true;
 }
 
 void ICACHE_FLASH_ATTR promiscuousCallback(uint8_t *buffer, uint16_t length) {
-  if (length < 24) {
+  if (length < 36) {
     return;
   }
 
   PromiscuousPacket *packet = reinterpret_cast<PromiscuousPacket *>(buffer);
+  const uint8_t *sourceMac = packet->payload + 10;
 
-  // ESP8266 ESP-NOW receive callbacks do not directly provide packet RSSI.
-  // This promiscuous callback captures radio metadata on the same channel and
-  // stores the most recent RSSI as an approximate signal-strength indicator.
+  // ESP8266 ESP-NOW receive callbacks do not expose RSSI. The promiscuous
+  // callback sees the WiFi frame metadata, so filter it by the expected
+  // transmitter MAC before using the RSSI value.
+  if (!macEquals(sourceMac, PET_NODE_MAC)) {
+    return;
+  }
+
   lastCapturedRssi = packet->rx_ctrl.rssi;
   lastPromiscPacketAtMs = millis();
   rssiUpdated = true;
@@ -140,21 +197,41 @@ void startPromiscuousSniffer() {
   wifi_promiscuous_enable(0);
   wifi_set_promiscuous_rx_cb(promiscuousCallback);
   wifi_promiscuous_enable(1);
-  Serial.println("Promiscuous RSSI sniffer enabled.");
+  Serial.println("Promiscuous RSSI sniffer enabled with Pet Node MAC filter.");
 }
 
 void stopPromiscuousSniffer() {
   wifi_promiscuous_enable(0);
 }
 
+bool isValidPacket(const PetPacket &packet) {
+  return packet.magic == PACKET_MAGIC &&
+         packet.protocolVersion == PROTOCOL_VERSION &&
+         strncmp(packet.petId, EXPECTED_PET_ID, sizeof(packet.petId)) == 0;
+}
+
 void onDataReceived(uint8_t *senderMac, uint8_t *incomingData, uint8_t len) {
+  if (!macEquals(senderMac, PET_NODE_MAC)) {
+    Serial.print("Ignoring packet from unexpected MAC: ");
+    Serial.println(formatMac(senderMac));
+    return;
+  }
+
   if (len != sizeof(PetPacket)) {
     Serial.print("Unexpected packet size: ");
     Serial.println(len);
     return;
   }
 
-  memcpy(&lastPacket, incomingData, sizeof(lastPacket));
+  PetPacket incomingPacket;
+  memcpy(&incomingPacket, incomingData, sizeof(incomingPacket));
+
+  if (!isValidPacket(incomingPacket)) {
+    Serial.println("Rejected packet with invalid magic, protocol version, or pet ID.");
+    return;
+  }
+
+  memcpy(&lastPacket, &incomingPacket, sizeof(lastPacket));
   lastPacketAtMs = millis();
   packetReceived = true;
 
@@ -170,10 +247,10 @@ void onDataReceived(uint8_t *senderMac, uint8_t *incomingData, uint8_t len) {
   Serial.println(lastPacket.uptimeSeconds);
 
   if (rssiUpdated) {
-    Serial.print("Approx RSSI: ");
+    Serial.print("Filtered RSSI: ");
     Serial.println(lastCapturedRssi);
   } else {
-    Serial.println("Approx RSSI not updated yet.");
+    Serial.println("Filtered RSSI not updated yet.");
   }
 }
 
@@ -221,18 +298,28 @@ String currentPetStatus() {
   return "Nearby";
 }
 
-bool shouldTurnBuzzerOn() {
-  if (!packetReceived) {
-    return false;
-  }
-
-  unsigned long ageMs = millis() - lastPacketAtMs;
-  return ageMs > PACKET_TIMEOUT_MS || (hasRecentRssiSample() && lastCapturedRssi <= RSSI_THRESHOLD_DBM);
+bool buzzerSilenced() {
+  return millis() < buzzerSilencedUntilMs;
 }
 
-void setBuzzer(bool enabled) {
-  buzzerOn = enabled;
+void writeBuzzer(bool enabled) {
+  buzzerOutputHigh = enabled;
   digitalWrite(BUZZER_PIN, enabled ? HIGH : LOW);
+}
+
+void updateBuzzerPattern(const String &statusText) {
+  if (buzzerSilenced() || statusText == "Nearby" || statusText == "Waiting") {
+    writeBuzzer(false);
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  unsigned long intervalMs = statusText == "Lost" ? 200 : 700;
+
+  if (nowMs - lastBuzzerToggleAtMs >= intervalMs) {
+    lastBuzzerToggleAtMs = nowMs;
+    writeBuzzer(!buzzerOutputHigh);
+  }
 }
 
 bool sendEmailAlert(const String &statusText) {
@@ -272,6 +359,7 @@ bool sendEmailAlert(const String &statusText) {
   body += "RSSI: " + String(lastCapturedRssi) + " dBm\r\n";
   body += "Last packet age: " + String(millis() - lastPacketAtMs) + " ms\r\n";
   body += "Packet counter: " + String(lastPacket.packetCounter) + "\r\n";
+  body += "Battery: " + String(lastPacket.batteryVoltage, 2) + " V\r\n";
   body += "Home Node IP: " + homeIpString + "\r\n";
   body += "\r\n";
   body += "This is an approximate RSSI-based alert.\r\n";
@@ -321,9 +409,9 @@ void handleRoot() {
   html += "<title>ESP8266 Pet Tracker</title>";
   html += "<style>";
   html += "body{font-family:Arial,sans-serif;background:#f4f7fb;color:#1f2937;margin:0;padding:24px;}";
-  html += ".card{max-width:720px;margin:0 auto;background:#fff;border-radius:16px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,0.08);}";
+  html += ".card{max-width:760px;margin:0 auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,0.08);}";
   html += "h1{margin-top:0;}table{width:100%;border-collapse:collapse;}td{padding:10px;border-bottom:1px solid #e5e7eb;}";
-  html += ".status{font-weight:bold;font-size:1.2rem;}.ok{color:#0f766e;}.warn{color:#b45309;}.bad{color:#b91c1c;}";
+  html += ".status{font-weight:bold;font-size:1.2rem;}a.button{display:inline-block;margin-top:16px;background:#1f2937;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none;}";
   html += "code{background:#eef2ff;padding:2px 6px;border-radius:6px;}";
   html += "</style></head><body><div class='card'>";
   html += "<h1>IoT Pet Tracker Dashboard</h1>";
@@ -331,14 +419,19 @@ void handleRoot() {
   html += "<table>";
   html += "<tr><td>Pet status</td><td class='status'>" + statusText + "</td></tr>";
   html += "<tr><td>Pet ID</td><td>" + String(packetReceived ? lastPacket.petId : EXPECTED_PET_ID) + "</td></tr>";
+  html += "<tr><td>Pet Node MAC</td><td>" + formatMac(PET_NODE_MAC) + "</td></tr>";
   html += "<tr><td>RSSI</td><td>" + String(lastCapturedRssi) + " dBm</td></tr>";
+  html += "<tr><td>RSSI sample</td><td>" + String(hasRecentRssiSample() ? "Recent" : "Waiting") + "</td></tr>";
   html += "<tr><td>Last packet age</td><td>" + String(packetAge) + " ms</td></tr>";
   html += "<tr><td>Packet counter</td><td>" + String(packetReceived ? lastPacket.packetCounter : 0) + "</td></tr>";
-  html += "<tr><td>Buzzer state</td><td>" + String(buzzerOn ? "ON" : "OFF") + "</td></tr>";
+  html += "<tr><td>Battery</td><td>" + String(packetReceived ? lastPacket.batteryVoltage : 0, 2) + " V</td></tr>";
+  html += "<tr><td>Buzzer state</td><td>" + String(buzzerOutputHigh ? "ON" : "OFF") + "</td></tr>";
+  html += "<tr><td>Buzzer silence</td><td>" + String(buzzerSilenced() ? "Active" : "Inactive") + "</td></tr>";
   html += "<tr><td>Email cooldown</td><td>" + emailCooldownState() + "</td></tr>";
   html += "<tr><td>Home Node IP</td><td>" + homeIpString + "</td></tr>";
   html += "<tr><td>WiFi channel</td><td>" + String(wifiChannel) + "</td></tr>";
   html += "</table>";
+  html += "<a class='button' href='/silence'>Silence buzzer for 2 minutes</a>";
   html += "</div></body></html>";
 
   server.send(200, "text/html", html);
@@ -353,14 +446,26 @@ void handleJson() {
   json += "\"petId\":\"" + String(packetReceived ? lastPacket.petId : EXPECTED_PET_ID) + "\",";
   json += "\"status\":\"" + statusText + "\",";
   json += "\"rssi\":" + String(lastCapturedRssi) + ",";
+  json += "\"rssiRecent\":" + jsonBool(hasRecentRssiSample()) + ",";
   json += "\"lastPacketAgeMs\":" + String(packetAge) + ",";
   json += "\"packetCounter\":" + String(packetReceived ? lastPacket.packetCounter : 0) + ",";
-  json += "\"buzzerOn\":" + jsonBool(buzzerOn) + ",";
+  json += "\"batteryVoltage\":" + String(packetReceived ? lastPacket.batteryVoltage : 0, 2) + ",";
+  json += "\"buzzerOn\":" + jsonBool(buzzerOutputHigh) + ",";
+  json += "\"buzzerSilenced\":" + jsonBool(buzzerSilenced()) + ",";
   json += "\"emailCooldownActive\":" + jsonBool(cooldownActive) + ",";
+  json += "\"petNodeMac\":\"" + formatMac(PET_NODE_MAC) + "\",";
   json += "\"homeNodeIp\":\"" + homeIpString + "\"";
   json += "}";
 
   server.send(200, "application/json", json);
+}
+
+void handleSilence() {
+  buzzerSilencedUntilMs = millis() + BUZZER_SILENCE_MS;
+  writeBuzzer(false);
+  Serial.println("Buzzer silenced from dashboard.");
+  server.sendHeader("Location", "/");
+  server.send(303, "text/plain", "");
 }
 
 void handleNotFound() {
@@ -370,6 +475,7 @@ void handleNotFound() {
 void startWebServer() {
   server.on("/", handleRoot);
   server.on("/json", handleJson);
+  server.on("/silence", handleSilence);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Web server started on port 80.");
@@ -381,7 +487,7 @@ void setup() {
   Serial.println("=== Home Node Boot ===");
 
   pinMode(BUZZER_PIN, OUTPUT);
-  setBuzzer(false);
+  writeBuzzer(false);
 
   emailConfigured = smtpConfigLooksFilled();
   if (!emailConfigured) {
@@ -420,7 +526,7 @@ void loop() {
   server.handleClient();
 
   String statusText = currentPetStatus();
-  setBuzzer(shouldTurnBuzzerOn());
+  updateBuzzerPattern(statusText);
 
   bool newAlertState = statusText == "Far" || statusText == "Lost";
   if (newAlertState && !alertConditionActive) {
@@ -431,7 +537,6 @@ void loop() {
     maybeSendAlertEmail(statusText);
   }
   alertConditionActive = newAlertState;
-  lastStatus = statusText;
 
   if (millis() - lastStatusLogAtMs >= 2000) {
     lastStatusLogAtMs = millis();
@@ -439,10 +544,12 @@ void loop() {
     Serial.print(statusText);
     Serial.print(", RSSI=");
     Serial.print(lastCapturedRssi);
+    Serial.print(", RSSIRecent=");
+    Serial.print(hasRecentRssiSample() ? "yes" : "no");
     Serial.print(", PacketAgeMs=");
     Serial.print(packetReceived ? millis() - lastPacketAtMs : 0);
     Serial.print(", Buzzer=");
-    Serial.println(buzzerOn ? "ON" : "OFF");
+    Serial.println(buzzerOutputHigh ? "ON" : "OFF");
   }
 
   if (!espNowReady) {

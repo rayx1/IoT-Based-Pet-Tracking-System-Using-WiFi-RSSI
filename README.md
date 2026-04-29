@@ -4,14 +4,16 @@ Two-node IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based 
 
 ## Features
 
-- `Pet Node` sends periodic ESP-NOW packets with pet ID, packet counter, uptime, and battery placeholder
-- `Home Node` receives packets and estimates signal strength using captured ESP-NOW frame RSSI
-- Buzzer alert when the pet is far away or packets stop arriving
+- `Pet Node` sends validated ESP-NOW packets with pet ID, packet counter, uptime, and battery voltage field
+- `Home Node` receives packets only from the configured Pet Node MAC
+- RSSI samples are filtered by Pet Node MAC to reduce interference from unrelated WiFi traffic
+- Buzzer alert uses slow beeps for `Far` and faster beeps for `Lost`
+- Dashboard includes a temporary buzzer silence control
 - SMTP email alert with cooldown to avoid spam
 - Web dashboard on port `80`
 - JSON API endpoint at `/json`
 - Serial debug logs for both nodes
-- Placeholder configuration section at the top of each sketch
+- Placeholder configuration section at the top of each sketch, with optional ignored `secrets.h`
 - Safe fallback behavior for WiFi or ESP-NOW setup failures
 
 ## System Architecture
@@ -74,18 +76,20 @@ See full notes in [docs/wiring.md](/F:/GOOGLE%20Antigravity/BCA/iot-pet-tracker-
 
 ```text
 iot-pet-tracker-espnow-rssi/
-├── README.md
-├── LICENSE
-├── .gitignore
-├── firmware/
-│   ├── pet_node/
-│   │   └── pet_node.ino
-│   └── home_node/
-│       └── home_node.ino
-└── docs/
-    ├── wiring.md
-    ├── setup.md
-    └── troubleshooting.md
+|-- README.md
+|-- LICENSE
+|-- .gitignore
+|-- firmware/
+|   |-- pet_node/
+|   |   |-- pet_node.ino
+|   |   `-- secrets.example.h
+|   `-- home_node/
+|       |-- home_node.ino
+|       `-- secrets.example.h
+`-- docs/
+    |-- wiring.md
+    |-- setup.md
+    `-- troubleshooting.md
 ```
 
 ## Installation
@@ -93,14 +97,12 @@ iot-pet-tracker-espnow-rssi/
 1. Install Arduino IDE.
 2. Install the ESP8266 board package from Board Manager.
 3. Install the `ESP Mail Client` library from Library Manager.
-4. Open [firmware/home_node/home_node.ino](/F:/GOOGLE%20Antigravity/BCA/iot-pet-tracker-espnow-rssi/firmware/home_node/home_node.ino).
-5. Edit the WiFi and SMTP placeholders near the top of the file.
-6. Upload the Home Node sketch to the home NodeMCU.
-7. Open Serial Monitor and copy the Home Node MAC address.
-8. Open [firmware/pet_node/pet_node.ino](/F:/GOOGLE%20Antigravity/BCA/iot-pet-tracker-espnow-rssi/firmware/pet_node/pet_node.ino).
-9. Paste the Home Node MAC into the `HOME_NODE_MAC` array.
-10. Upload the Pet Node sketch to the pet NodeMCU.
-11. Open the Home Node IP shown in Serial Monitor in a browser.
+4. Upload the Pet Node once and copy its MAC from Serial Monitor.
+5. Paste the Pet Node MAC into the Home Node `PET_NODE_MAC_BYTES` config.
+6. Upload the Home Node and copy its MAC from Serial Monitor.
+7. Paste the Home Node MAC into the Pet Node `HOME_NODE_MAC_BYTES` config.
+8. Upload the Pet Node again.
+9. Open the Home Node IP shown in Serial Monitor in a browser.
 
 Detailed guide: [docs/setup.md](/F:/GOOGLE%20Antigravity/BCA/iot-pet-tracker-espnow-rssi/docs/setup.md)
 
@@ -119,13 +121,31 @@ Home Node MAC: 84:F3:EB:12:34:56
 
 ## How to Paste the Home Node MAC into Pet Node Code
 
-Find this section in `pet_node.ino`:
+Find this section in `pet_node.ino` or `firmware/pet_node/secrets.h`:
 
 ```cpp
-uint8_t HOME_NODE_MAC[] = {0x84, 0xF3, 0xEB, 0x12, 0x34, 0x56};
+#define HOME_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0x12, 0x34, 0x56}
 ```
 
 Replace the six hex values with the Home Node MAC from Serial Monitor.
+
+## How to Paste the Pet Node MAC into Home Node Code
+
+Find this section in `home_node.ino` or `firmware/home_node/secrets.h`:
+
+```cpp
+#define PET_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}
+```
+
+Replace the six hex values with the Pet Node MAC from Serial Monitor. This is used for packet filtering and RSSI filtering.
+
+## Optional secrets.h Workflow
+
+Each firmware folder includes a `secrets.example.h`.
+
+1. Duplicate `secrets.example.h` as `secrets.h`.
+2. Edit `secrets.h` with your WiFi, SMTP, and MAC values.
+3. Keep `secrets.h` private. It is already ignored by `.gitignore`.
 
 ## How to Configure Email SMTP
 
@@ -138,6 +158,8 @@ Edit these placeholders at the top of `home_node.ino`:
 - `SENDER_EMAIL`
 - `SENDER_APP_PASSWORD`
 - `RECIPIENT_EMAIL`
+
+If using `secrets.h`, edit the matching `*_VALUE` macros instead.
 
 Example for Gmail SMTP:
 
@@ -170,6 +192,7 @@ The dashboard shows:
 - Last packet age
 - Packet counter
 - Buzzer state
+- Buzzer silence state
 - Email cooldown state
 - Home Node IP
 
@@ -190,8 +213,11 @@ Example response:
   "rssi": -61,
   "lastPacketAgeMs": 842,
   "packetCounter": 128,
+  "batteryVoltage": 4.00,
   "buzzerOn": false,
+  "buzzerSilenced": false,
   "emailCooldownActive": false,
+  "petNodeMac": "84:F3:EB:AA:BB:CC",
   "homeNodeIp": "192.168.1.50"
 }
 ```
@@ -211,6 +237,7 @@ Example response:
 - RSSI only gives an approximate idea of distance
 - Different board placement angles can change readings
 - This project is best for rough proximity detection, not exact location tracking
+- Filtered RSSI improves stability, but it is still not a precise distance measurement
 
 ## Future Improvements
 
@@ -223,4 +250,3 @@ Example response:
 ## Safety Note
 
 RSSI is approximate and must not be used as a life-critical tracking method for pets, people, or property.
-

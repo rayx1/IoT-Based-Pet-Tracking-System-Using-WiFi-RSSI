@@ -10,6 +10,7 @@
 ## Pet node not detected
 
 - Verify the Home Node MAC was copied correctly into `pet_node.ino`.
+- Verify the Pet Node MAC was copied correctly into `home_node.ino`.
 - Confirm both boards connect to the same WiFi router SSID.
 - Check that both boards report the same WiFi channel in Serial Monitor.
 - Move the boards closer together during first testing.
@@ -18,8 +19,9 @@
 
 - Wait for at least one valid ESP-NOW packet from the pet node.
 - Confirm the home node logs show both packet reception and RSSI capture.
-- Make sure the pet node MAC seen by the home node matches the sender MAC.
+- Make sure `PET_NODE_MAC_BYTES` matches the Pet Node MAC exactly.
 - If RSSI stays at `-127`, packets may be arriving without matching promiscuous frame capture.
+- If packets arrive but RSSI does not update, temporarily test with the boards close together and confirm the Pet Node MAC filter.
 
 ## Email not sending
 
@@ -46,6 +48,7 @@
 - Increase `RSSI_THRESHOLD_DBM` because the current threshold may be too strict.
 - Confirm the buzzer wiring is connected to `D5` and `GND`.
 - Check if packet timeout is being triggered because the pet node is not sending.
+- Check whether the dashboard silence state is active.
 - Some buzzer modules are active-low; if needed, invert the buzzer logic in code.
 
 ## Wrong WiFi channel
@@ -54,4 +57,3 @@
 - Make sure both connect to the same SSID before ESP-NOW exchange.
 - If your router uses band steering or changing channels, test with a fixed 2.4 GHz channel.
 - Reboot both nodes after router channel changes.
-

@@ -17,25 +17,34 @@
    - Open `Tools -> Manage Libraries`.
    - Install `ESP Mail Client` by Mobizt.
 
-4. Upload Home Node
-   - Open `firmware/home_node/home_node.ino`.
+4. Upload Pet Node once
+   - Open `firmware/pet_node/pet_node.ino`.
    - Select a NodeMCU ESP8266 board.
-   - Edit WiFi and SMTP placeholders.
+   - Edit WiFi placeholders or create `firmware/pet_node/secrets.h` from `secrets.example.h`.
    - Upload the sketch.
 
-5. Copy Home Node MAC
+5. Copy Pet Node MAC
    - Open Serial Monitor at `115200`.
-   - Note the printed Home Node MAC address.
+   - Note the printed Pet Node MAC address.
 
-6. Paste MAC into Pet Node
+6. Paste Pet MAC into Home Node
+   - Open `firmware/home_node/home_node.ino`.
+   - Replace `PET_NODE_MAC_BYTES`, or edit `firmware/home_node/secrets.h`.
+   - Edit WiFi and SMTP placeholders.
+
+7. Upload Home Node
+   - Upload the sketch to the home NodeMCU.
+   - Open Serial Monitor at `115200`.
+   - Note the printed Home Node MAC address and IP address.
+
+8. Paste Home MAC into Pet Node
    - Open `firmware/pet_node/pet_node.ino`.
-   - Replace the `HOME_NODE_MAC` values with the Home Node MAC.
+   - Replace `HOME_NODE_MAC_BYTES`, or edit `firmware/pet_node/secrets.h`.
 
-7. Upload Pet Node
+9. Upload Pet Node again
    - Confirm pet node WiFi placeholders match the same router.
    - Upload the sketch to the second NodeMCU.
 
-8. Open dashboard
+10. Open dashboard
    - Read the Home Node IP from Serial Monitor.
    - Open `http://HOME_NODE_IP/` in a browser on the same network.
-

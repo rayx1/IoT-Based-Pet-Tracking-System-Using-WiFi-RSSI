@@ -1,23 +1,54 @@
 #include <ESP8266WiFi.h>
 #include <espnow.h>
 
+// Optional local credentials/config file.
+// Copy secrets.example.h to secrets.h, edit it, and keep secrets.h out of Git.
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#endif
+
 // =========================
 // User configuration
-// Edit these placeholders before uploading.
+// Edit these placeholders, or define the same names in secrets.h.
 // =========================
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
-const char *PET_ID = "PET-001";
+#ifndef WIFI_SSID_VALUE
+#define WIFI_SSID_VALUE "YOUR_WIFI_SSID"
+#endif
 
+#ifndef WIFI_PASSWORD_VALUE
+#define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
+#endif
+
+#ifndef PET_ID_VALUE
+#define PET_ID_VALUE "PET-001"
+#endif
+
+#ifndef HOME_NODE_MAC_BYTES
 // Replace this with the MAC printed by the Home Node sketch.
-uint8_t HOME_NODE_MAC[] = {0x84, 0xF3, 0xEB, 0x12, 0x34, 0x56};
+#define HOME_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0x12, 0x34, 0x56}
+#endif
+
+const char *WIFI_SSID = WIFI_SSID_VALUE;
+const char *WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
+const char *PET_ID = PET_ID_VALUE;
+uint8_t HOME_NODE_MAC[] = HOME_NODE_MAC_BYTES;
+
+const uint32_t PACKET_MAGIC = 0x50544731; // "PTG1"
+const uint8_t PROTOCOL_VERSION = 1;
 
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long SEND_INTERVAL_MS = 2000;
 
+// Set to true after wiring A0 through a safe resistor divider.
+const bool USE_ADC_BATTERY_READING = false;
+const float ADC_REFERENCE_VOLTAGE = 3.30f;
+const float BATTERY_DIVIDER_RATIO = 2.00f;
+
 // Packet structure sent over ESP-NOW.
 // Keep this identical on both nodes.
 struct PetPacket {
+  uint32_t magic;
+  uint8_t protocolVersion;
   char petId[16];
   uint32_t packetCounter;
   float batteryVoltage;
@@ -91,17 +122,23 @@ bool initEspNow() {
   return true;
 }
 
-float readBatteryVoltagePlaceholder() {
-  // Placeholder for future ADC-based battery scaling.
-  // Replace with a proper resistor divider and ADC conversion if needed.
-  return 4.00f;
+float readBatteryVoltage() {
+  if (!USE_ADC_BATTERY_READING) {
+    return 4.00f;
+  }
+
+  int rawAdc = analogRead(A0);
+  float pinVoltage = (rawAdc / 1023.0f) * ADC_REFERENCE_VOLTAGE;
+  return pinVoltage * BATTERY_DIVIDER_RATIO;
 }
 
 void preparePacket() {
   memset(&outgoingPacket, 0, sizeof(outgoingPacket));
+  outgoingPacket.magic = PACKET_MAGIC;
+  outgoingPacket.protocolVersion = PROTOCOL_VERSION;
   strncpy(outgoingPacket.petId, PET_ID, sizeof(outgoingPacket.petId) - 1);
   outgoingPacket.packetCounter = packetCounter++;
-  outgoingPacket.batteryVoltage = readBatteryVoltagePlaceholder();
+  outgoingPacket.batteryVoltage = readBatteryVoltage();
   outgoingPacket.uptimeSeconds = millis() / 1000UL;
 }
 
@@ -118,7 +155,10 @@ void sendPacket() {
   Serial.print("Packet #");
   Serial.print(outgoingPacket.packetCounter);
   Serial.print(" sent, result code: ");
-  Serial.println(result);
+  Serial.print(result);
+  Serial.print(", battery=");
+  Serial.print(outgoingPacket.batteryVoltage, 2);
+  Serial.println(" V");
 }
 
 void setup() {
@@ -142,7 +182,7 @@ void loop() {
   }
 
   if (wifiReady && WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi connection lost. Reconnecting...");
+    Serial.println("WiFi connection lost. Restarting for clean channel lock...");
     wifiReady = false;
     espNowReady = false;
     ESP.restart();
@@ -153,4 +193,3 @@ void loop() {
     sendPacket();
   }
 }
-
