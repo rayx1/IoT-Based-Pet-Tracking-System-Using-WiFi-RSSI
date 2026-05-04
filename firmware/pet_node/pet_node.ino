@@ -1,48 +1,18 @@
 #include <ESP8266WiFi.h>
 #include <espnow.h>
 
-// Optional local credentials/config file.
-// Copy secrets.example.h to secrets.h, edit it, and keep secrets.h out of Git.
-#if __has_include("secrets.h")
-  #include "secrets.h"
+// All user-editable config (WiFi, pet ID, home node MAC) lives in secrets.h.
+// Edit firmware/pet_node/secrets.h with your values.
+// secrets.h is gitignored so your credentials never reach the repo.
+#if !__has_include("secrets.h")
+  #error "secrets.h is missing from firmware/pet_node/. See README for the required macros."
 #endif
+#include "secrets.h"
 
-// =========================
-// User configuration
-// Edit these placeholders, or define the same names in secrets.h.
-// =========================
-#ifndef WIFI_SSID_VALUE
-#define WIFI_SSID_VALUE "YOUR_WIFI_SSID"
-#endif
-
-#ifndef WIFI_PASSWORD_VALUE
-#define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
-#endif
-
-#ifndef PET_ID_VALUE
-#define PET_ID_VALUE "PET-001"
-#endif
-
-#ifndef HOME_NODE_MAC_BYTES
-// Replace this with the MAC printed by the Home Node sketch.
-#define HOME_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0x12, 0x34, 0x56}
-#endif
-
-const char *WIFI_SSID = WIFI_SSID_VALUE;
-const char *WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
-const char *PET_ID = PET_ID_VALUE;
 uint8_t HOME_NODE_MAC[] = HOME_NODE_MAC_BYTES;
 
 const uint32_t PACKET_MAGIC = 0x50544731; // "PTG1"
 const uint8_t PROTOCOL_VERSION = 1;
-
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long SEND_INTERVAL_MS = 2000;
-
-// Set to true after wiring A0 through a safe resistor divider.
-const bool USE_ADC_BATTERY_READING = false;
-const float ADC_REFERENCE_VOLTAGE = 3.30f;
-const float BATTERY_DIVIDER_RATIO = 2.00f;
 
 // Packet structure sent over ESP-NOW.
 // Keep this identical on both nodes.
@@ -68,6 +38,18 @@ void printMacAddress() {
   Serial.println(WiFi.macAddress());
 }
 
+void printPetNodeIdentity() {
+  Serial.println();
+  Serial.println("----- Pet Node Identity -----");
+  Serial.print("Pet ID: ");
+  Serial.println(PET_ID_VALUE);
+  Serial.print("Pet Node MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("Pet Node IP: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "not connected yet");
+  Serial.println("-----------------------------");
+}
+
 void onDataSent(uint8_t *macAddr, uint8_t sendStatus) {
   Serial.print("ESP-NOW send status: ");
   Serial.println(sendStatus == 0 ? "Delivery success" : "Delivery fail");
@@ -81,10 +63,10 @@ bool connectToWifiAndLockChannel() {
   WiFi.disconnect();
   delay(50);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSID_VALUE, WIFI_PASSWORD_VALUE);
 
   unsigned long startMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS_VALUE) {
     delay(250);
     Serial.print(".");
   }
@@ -92,15 +74,20 @@ bool connectToWifiAndLockChannel() {
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi connect failed. Pet node will retry later.");
+    Serial.print("Pet Node MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Pet Node IP: ");
+    Serial.println(WiFi.localIP().toString());
     return false;
   }
 
   lockedChannel = WiFi.channel();
-  Serial.print("Pet node connected. IP: ");
+  Serial.print("Pet Node connected. IP: ");
   Serial.println(WiFi.localIP());
+  Serial.print("Pet Node MAC: ");
+  Serial.println(WiFi.macAddress());
   Serial.print("Locked WiFi channel: ");
   Serial.println(lockedChannel);
-  printMacAddress();
   return true;
 }
 
@@ -123,20 +110,20 @@ bool initEspNow() {
 }
 
 float readBatteryVoltage() {
-  if (!USE_ADC_BATTERY_READING) {
+  if (!USE_ADC_BATTERY_READING_VALUE) {
     return 4.00f;
   }
 
   int rawAdc = analogRead(A0);
-  float pinVoltage = (rawAdc / 1023.0f) * ADC_REFERENCE_VOLTAGE;
-  return pinVoltage * BATTERY_DIVIDER_RATIO;
+  float pinVoltage = (rawAdc / 1023.0f) * ADC_REFERENCE_VOLTAGE_VALUE;
+  return pinVoltage * BATTERY_DIVIDER_RATIO_VALUE;
 }
 
 void preparePacket() {
   memset(&outgoingPacket, 0, sizeof(outgoingPacket));
   outgoingPacket.magic = PACKET_MAGIC;
   outgoingPacket.protocolVersion = PROTOCOL_VERSION;
-  strncpy(outgoingPacket.petId, PET_ID, sizeof(outgoingPacket.petId) - 1);
+  strncpy(outgoingPacket.petId, PET_ID_VALUE, sizeof(outgoingPacket.petId) - 1);
   outgoingPacket.packetCounter = packetCounter++;
   outgoingPacket.batteryVoltage = readBatteryVoltage();
   outgoingPacket.uptimeSeconds = millis() / 1000UL;
@@ -165,6 +152,9 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("=== Pet Node Boot ===");
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  printPetNodeIdentity();
 
   wifiReady = connectToWifiAndLockChannel();
   if (wifiReady) {
@@ -183,12 +173,16 @@ void loop() {
 
   if (wifiReady && WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi connection lost. Restarting for clean channel lock...");
+    Serial.print("Pet Node MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Pet Node last known IP: ");
+    Serial.println(WiFi.localIP().toString());
     wifiReady = false;
     espNowReady = false;
     ESP.restart();
   }
 
-  if (millis() - lastSendAtMs >= SEND_INTERVAL_MS) {
+  if (millis() - lastSendAtMs >= SEND_INTERVAL_MS_VALUE) {
     lastSendAtMs = millis();
     sendPacket();
   }

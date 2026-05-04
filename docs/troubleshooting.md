@@ -1,5 +1,12 @@
 # Troubleshooting
 
+## Compile error: missing `secrets.h`
+
+- Copy `firmware/pet_node/secrets.example.h` to `firmware/pet_node/secrets.h`.
+- Copy `firmware/home_node/secrets.example.h` to `firmware/home_node/secrets.h`.
+- Edit the copied files with your local WiFi, SMTP, MAC, and pet roster values.
+- Do not rename `secrets.example.h`; the sketches intentionally require `secrets.h`.
+
 ## ESP-NOW init failed
 
 - Confirm the board selected in Arduino IDE is an ESP8266 board, not ESP32.
@@ -17,8 +24,8 @@
 
 ## "Rejected packet ... pet ID mismatch"
 
-- The MAC matches an entry in `PET_NODE_LIST`, but the pet node's `PET_ID_VALUE` does not equal the `PROTOCOL_PET_ID` you wrote in that entry.
-- Open the offending pet node sketch, set `PET_ID_VALUE` to the same string used in the home node entry, and re-upload.
+- The MAC matches an entry in `PET_NODE_LIST`, but the pet node's `PET_ID_VALUE` does not equal the `PROTOCOL_PET_ID` in that entry.
+- Set `PET_ID_VALUE` to the same string used in the home node entry and re-upload that pet node.
 
 ## "Ignoring packet from unknown MAC"
 
@@ -27,29 +34,23 @@
 
 ## RSSI not updating for one specific pet
 
-- Confirm that pet's MAC byte sequence in `PET_NODE_LIST` exactly matches what the pet's Serial Monitor prints (case-insensitive, but every byte must match).
-- The dashboard shows `RSSI sample: Stale` when no matching frame has been seen in the last 3 seconds.
-- If only one of several pets shows stale RSSI while others update, the entry for that pet has the wrong MAC bytes.
+- Confirm that pet's MAC byte sequence in `PET_NODE_LIST` exactly matches what the pet's Serial Monitor prints.
+- The dashboard shows `RSSI sample: Stale` when no matching frame has been seen in the last few seconds.
+- If only one of several pets shows stale RSSI while others update, the entry for that pet likely has the wrong MAC bytes.
 
-## RSSI stalls for ALL pets after long uptime
+## RSSI stalls for all pets after long uptime
 
-- ESP-NOW + STA + promiscuous sniffer + WebServer share one radio. Some firmware combinations destabilise after hours of load.
+- ESP-NOW, STA mode, promiscuous sniffing, and `ESP8266WebServer` share one radio.
 - Try power-cycling the home node.
-- If the issue is reproducible, reduce dashboard refresh rate (the meta-refresh in the HTML is currently 3 s) or reduce per-pet `SEND_INTERVAL_MS` on the pet nodes to lighten the air.
-- Last-resort: comment out `startPromiscuousSniffer()` and accept losing the RSSI signal in exchange for stability.
+- If the issue is reproducible, reduce the dashboard refresh rate or increase `SEND_INTERVAL_MS_VALUE` on the pet nodes.
+- Last resort: comment out `startPromiscuousSniffer()` and accept losing RSSI in exchange for stability.
 
 ## Email not sending
 
-- Re-check `SMTP_HOST`, `SMTP_PORT`, sender email, and app password.
+- Re-check `SMTP_HOST_VALUE`, `SMTP_PORT_VALUE`, sender email, and app password.
+- Use implicit SSL SMTP on port `465`; STARTTLS on port `587` is not implemented by this sketch.
 - Confirm your WiFi internet access is working.
-- Verify the email library is installed correctly.
 - Read the Serial Monitor SMTP error text.
-
-## Email timestamps are wildly wrong
-
-- `SMTP_TIME_GMT_OFFSET_VALUE` units depend on your installed `ESP-Mail-Client` version.
-- Older builds expect seconds (`19800` = IST). Newer builds expect hours (`5.5` = IST).
-- Set it to `0` for UTC if the wrong unit causes nonsensical dates.
 
 ## Gmail authentication error
 
@@ -62,25 +63,25 @@
 - Confirm the Home Node connected to WiFi and printed an IP address.
 - Make sure your phone or laptop is on the same network.
 - Open the exact IP shown in Serial Monitor.
-- If needed, reboot the Home Node and try again.
+- Reboot the Home Node and try again if the IP is stale.
 
 ## Silence button does nothing / returns 405
 
-- The endpoint is now `POST /silence`. Hitting it via a plain `GET` (e.g. typing the URL in the browser bar) returns `405 Use POST`.
-- Use the dashboard's silence form. If you scripted a curl call, use `curl -X POST http://HOME_IP/silence`.
-- If you set `DASHBOARD_TOKEN_VALUE`, you must also pass `-d "token=YOUR_TOKEN"`.
+- The endpoint is `POST /silence`. A plain `GET` returns `405 Use POST`.
+- Use the dashboard's silence form.
+- If you set `DASHBOARD_TOKEN_VALUE`, submit the matching token in the dashboard form.
 
 ## Buzzer always ON
 
-- Increase `RSSI_THRESHOLD_DBM` because the current threshold may be too strict.
+- Increase `RSSI_THRESHOLD_DBM_VALUE` because the current threshold may be too strict.
 - Confirm the buzzer wiring is connected to `D5` and `GND`.
 - Check if any pet's packet timeout is being triggered.
 - Check whether the dashboard silence state is active.
-- Some buzzer modules are active-low; if needed, invert the buzzer logic in `writeBuzzer`.
+- Some buzzer modules are active-low; if needed, invert the logic in `writeBuzzer`.
 
 ## Buzzer pattern with multiple pets
 
-- The buzzer reflects the **most urgent pet**: any pet `Lost` produces fast beeps; otherwise any pet `Far` produces slow beeps.
+- The buzzer reflects the most urgent pet: any `Lost` pet produces fast beeps; otherwise any `Far` pet produces slow beeps.
 - A single silence press silences the buzzer for 2 minutes regardless of how many pets are alerting.
 
 ## Wrong WiFi channel

@@ -1,6 +1,6 @@
 # iot-pet-tracker-espnow-rssi
 
-IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based proximity detection, buzzer alerts, SMTP email warnings, and a built-in web dashboard. Supports **multiple pet nodes** tracked from a single home node.
+IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based proximity detection, buzzer alerts, SMTP-over-SSL email warnings, and a built-in web dashboard. Supports **multiple pet nodes** tracked from a single home node.
 
 ## Features
 
@@ -10,12 +10,12 @@ IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based proximity
 - RSSI samples are filtered per-pet by source MAC to reduce interference from unrelated WiFi traffic
 - Per-pet status: `Nearby`, `Far`, `Lost`, `Waiting`
 - Buzzer alert reflects the most urgent pet: slow beep for any `Far`, faster beep when any pet is `Lost`
-- Per-pet SMTP email cooldown so each pet alerts independently without spam
+- Per-pet SMTP-over-SSL email cooldown so each pet alerts independently without spam
 - Dashboard renders one card per pet plus a global control panel
 - Dashboard `Silence` control is a POST endpoint with optional shared-token guard
 - JSON API at `/json` returns the full roster as an array
 - Serial debug logs for both nodes
-- Placeholder configuration section at the top of each sketch, with optional ignored `secrets.h`
+- Local `secrets.h` configuration files keep credentials out of the publishable repo
 - Safe fallback behavior for WiFi or ESP-NOW setup failures
 
 ## System Architecture
@@ -73,8 +73,7 @@ See full notes in [docs/wiring.md](docs/wiring.md).
   - `ESP8266WiFi`
   - `ESP8266WebServer`
   - `espnow`
-- External library:
-  - `ESP Mail Client` by Mobizt
+- No external SMTP library is required. Email uses ESP8266's built-in `WiFiClientSecure`.
 
 ## Repository Layout
 
@@ -100,13 +99,14 @@ iot-pet-tracker-espnow-rssi/
 
 1. Install Arduino IDE.
 2. Install the ESP8266 board package from Board Manager.
-3. Install the `ESP Mail Client` library from Library Manager.
-4. **For each pet node**: edit `PET_ID_VALUE` to a unique string (`PET-001`, `PET-002`, ...), upload, copy its MAC from Serial Monitor.
-5. Add an entry per pet to the Home Node `PET_NODE_LIST` (MAC, pet ID, display name).
-6. Upload the Home Node and copy its MAC from Serial Monitor.
-7. Paste the Home Node MAC into each pet node's `HOME_NODE_MAC_BYTES`.
-8. Upload each pet node again.
-9. Open the Home Node IP shown in Serial Monitor in a browser.
+3. Copy `firmware/pet_node/secrets.example.h` to `firmware/pet_node/secrets.h`.
+4. Copy `firmware/home_node/secrets.example.h` to `firmware/home_node/secrets.h`.
+5. **For each pet node**: in `firmware/pet_node/secrets.h` set `PET_ID_VALUE` to a unique string (`PET-001`, `PET-002`, ...) and the WiFi creds. Upload, then copy its MAC from Serial Monitor.
+6. In `firmware/home_node/secrets.h`, add an entry per pet to `PET_NODE_LIST` (MAC, pet ID, display name) plus your WiFi and SMTP values.
+7. Upload the Home Node and copy its MAC from Serial Monitor.
+8. Paste the Home Node MAC into each pet node's `HOME_NODE_MAC_BYTES` in `firmware/pet_node/secrets.h`.
+9. Upload each pet node again.
+10. Open the Home Node IP shown in Serial Monitor in a browser.
 
 Detailed guide: [docs/setup.md](docs/setup.md).
 
@@ -143,17 +143,22 @@ Example:
 Home Node MAC: 84:F3:EB:12:34:56
 ```
 
-## Optional secrets.h Workflow
+## secrets.h Workflow
 
-Each firmware folder includes a `secrets.example.h`.
+All user-editable config (WiFi, SMTP, pet roster, MAC values, dashboard token) lives in `secrets.h`. There is one `secrets.h` per firmware folder:
 
-1. Duplicate `secrets.example.h` as `secrets.h`.
-2. Edit `secrets.h` with your WiFi, SMTP, MAC, and pet roster values.
-3. Keep `secrets.h` private. It is already ignored by `.gitignore`.
+- `firmware/pet_node/secrets.h`
+- `firmware/home_node/secrets.h`
+
+Both firmware folders ship with a `secrets.example.h` template. Copy it to `secrets.h`, then edit your local `secrets.h` with real WiFi creds, SMTP creds, MACs, and pet roster.
+
+`secrets.h` is listed in `.gitignore` so your edited copy never reaches the repo. The sketches will refuse to compile if `secrets.h` is missing.
+
+There is no separate "edit the placeholders at the top of the .ino" step - credentials live in exactly one place.
 
 ## How to Configure Email SMTP
 
-Edit these placeholders at the top of `home_node.ino` (or in `secrets.h`):
+Edit these in `firmware/home_node/secrets.h`:
 
 - `WIFI_SSID_VALUE`
 - `WIFI_PASSWORD_VALUE`
@@ -162,7 +167,6 @@ Edit these placeholders at the top of `home_node.ino` (or in `secrets.h`):
 - `SENDER_EMAIL_VALUE`
 - `SENDER_APP_PASSWORD_VALUE`
 - `RECIPIENT_EMAIL_VALUE`
-- `SMTP_TIME_GMT_OFFSET_VALUE`
 
 Example for Gmail SMTP:
 
@@ -170,15 +174,6 @@ Example for Gmail SMTP:
 - Port: `465`
 - Sender email: your Gmail address
 - App password: 16-character Gmail App Password
-
-### SMTP timezone offset
-
-`SMTP_TIME_GMT_OFFSET_VALUE` controls the DATE header that ESP-Mail-Client writes. The unit depends on the installed library version:
-
-- Older builds expect **seconds** (`19800` = UTC+5:30 IST)
-- Newer builds expect **hours** (`5.5` = UTC+5:30 IST)
-
-If unsure, leave it at `0`. SMTP servers usually rewrite the timestamp anyway.
 
 ### Gmail App Password Note
 

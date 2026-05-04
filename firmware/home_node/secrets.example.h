@@ -12,25 +12,19 @@
 #define SENDER_APP_PASSWORD_VALUE "YOUR_APP_PASSWORD"
 #define RECIPIENT_EMAIL_VALUE "recipient@example.com"
 
-// SMTP DATE-header offset. Units depend on the ESP-Mail-Client version.
-// Older builds expect seconds (19800 = UTC+5:30 IST).
-// Newer builds expect hours (5.5    = UTC+5:30 IST).
-// Set 0 for UTC if unsure.
-#define SMTP_TIME_GMT_OFFSET_VALUE 0
+// Optional dashboard token for POST /silence.
+// Leave empty to disable token checking.
+#define DASHBOARD_TOKEN_VALUE ""
 
-// Pet roster. One entry per pet node:
-//   { {mac bytes}, "PROTOCOL_PET_ID", "Display Name" }
-// PROTOCOL_PET_ID must match the pet node's PET_ID_VALUE exactly.
-//
-// Single pet:
+// Main behavior tuning.
+#define RSSI_THRESHOLD_DBM_VALUE -75
+#define PACKET_TIMEOUT_MS_VALUE 10000UL
+#define RSSI_FRESH_MS_VALUE 3000UL
+#define EMAIL_COOLDOWN_MS_VALUE 300000UL
+#define WIFI_CONNECT_TIMEOUT_MS_VALUE 15000UL
+#define BUZZER_SILENCE_MS_VALUE 120000UL
+
+// Replace each MAC with the value printed by that Pet Node Serial Monitor.
+// Format: { {mac bytes}, "PROTOCOL_PET_ID", "Display Name" }
 #define PET_NODE_LIST \
   { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Bella" }
-
-// Multiple pets (uncomment and adjust):
-// #define PET_NODE_LIST \
-//   { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Bella" }, \
-//   { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCD}, "PET-002", "Max"   }, \
-//   { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCE}, "PET-003", "Coco"  }
-
-// Optional shared token for the /silence endpoint. Leave empty to disable.
-#define DASHBOARD_TOKEN_VALUE ""

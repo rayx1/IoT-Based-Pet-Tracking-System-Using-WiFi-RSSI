@@ -1,97 +1,51 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <WiFiClientSecure.h>
 #include <espnow.h>
-#include <ESP_Mail_Client.h>
 
 extern "C" {
   #include <user_interface.h>
 }
 
-// Optional local credentials/config file.
-// Copy secrets.example.h to secrets.h, edit it, and keep secrets.h out of Git.
-#if __has_include("secrets.h")
-  #include "secrets.h"
-#endif
+// ESP8266 NONOS SDK promiscuous-callback metadata. Use a project-local type
+// name so we do not collide with cores that already expose `RxControl`.
+struct EspNowRxControlCompat {
+  signed rssi : 8;
+  unsigned rate : 4;
+  unsigned is_group : 1;
+  unsigned : 1;
+  unsigned sig_mode : 2;
+  unsigned legacy_length : 12;
+  unsigned damatch0 : 1;
+  unsigned damatch1 : 1;
+  unsigned bssidmatch0 : 1;
+  unsigned bssidmatch1 : 1;
+  unsigned MCS : 7;
+  unsigned CWB : 1;
+  unsigned HT_length : 16;
+  unsigned Smoothing : 1;
+  unsigned Not_Sounding : 1;
+  unsigned : 1;
+  unsigned Aggregation : 1;
+  unsigned STBC : 2;
+  unsigned FEC_CODING : 1;
+  unsigned SGI : 1;
+  unsigned rxend_state : 8;
+  unsigned ampdu_cnt : 8;
+  unsigned channel : 4;
+  unsigned : 12;
+};
 
-// =========================
-// User configuration
-// Edit these placeholders, or define the same names in secrets.h.
-// =========================
-#ifndef WIFI_SSID_VALUE
-#define WIFI_SSID_VALUE "YOUR_WIFI_SSID"
+// All user-editable config (WiFi, SMTP, pet roster, dashboard token, GMT offset)
+// lives in secrets.h. Edit firmware/home_node/secrets.h with your values.
+// secrets.h is gitignored so your credentials never reach the repo.
+#if !__has_include("secrets.h")
+  #error "secrets.h is missing from firmware/home_node/. See README for the required macros."
 #endif
-
-#ifndef WIFI_PASSWORD_VALUE
-#define WIFI_PASSWORD_VALUE "YOUR_WIFI_PASSWORD"
-#endif
-
-#ifndef SMTP_HOST_VALUE
-#define SMTP_HOST_VALUE "smtp.example.com"
-#endif
-
-#ifndef SMTP_PORT_VALUE
-#define SMTP_PORT_VALUE 465
-#endif
-
-#ifndef SENDER_EMAIL_VALUE
-#define SENDER_EMAIL_VALUE "sender@example.com"
-#endif
-
-#ifndef SENDER_APP_PASSWORD_VALUE
-#define SENDER_APP_PASSWORD_VALUE "YOUR_APP_PASSWORD"
-#endif
-
-#ifndef RECIPIENT_EMAIL_VALUE
-#define RECIPIENT_EMAIL_VALUE "recipient@example.com"
-#endif
-
-// SMTP DATE-header offset. Units depend on the ESP-Mail-Client version.
-// Older builds expect seconds (e.g. 19800 = UTC+5:30 IST), newer builds expect hours.
-// Set whatever your installed version expects; default 0 = UTC.
-#ifndef SMTP_TIME_GMT_OFFSET_VALUE
-#define SMTP_TIME_GMT_OFFSET_VALUE 0
-#endif
-
-// Pet roster. Add one entry per pet node. Each entry is:
-//   { {mac bytes}, "PROTOCOL_PET_ID", "Display Name" }
-// PROTOCOL_PET_ID must match the pet node's PET_ID_VALUE exactly (used for packet validation).
-// Display Name is shown on the dashboard. Use the same string as PROTOCOL_PET_ID if you do not care.
-//
-// Example with two pets:
-//   #define PET_NODE_LIST \
-//     { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Bella" }, \
-//     { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCD}, "PET-002", "Max"   }
-#ifndef PET_NODE_LIST
-#define PET_NODE_LIST \
-  { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Pet 1" }
-#endif
-
-// Optional dashboard token. If defined and non-empty, /silence requires
-// the matching value as a "token" form field. Leave undefined to disable.
-#ifndef DASHBOARD_TOKEN_VALUE
-#define DASHBOARD_TOKEN_VALUE ""
-#endif
-
-const char *WIFI_SSID = WIFI_SSID_VALUE;
-const char *WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
-const char *SMTP_HOST = SMTP_HOST_VALUE;
-const int SMTP_PORT = SMTP_PORT_VALUE;
-const char *SENDER_EMAIL = SENDER_EMAIL_VALUE;
-const char *SENDER_APP_PASSWORD = SENDER_APP_PASSWORD_VALUE;
-const char *RECIPIENT_EMAIL = RECIPIENT_EMAIL_VALUE;
-const float SMTP_TIME_GMT_OFFSET = SMTP_TIME_GMT_OFFSET_VALUE;
-const char *DASHBOARD_TOKEN = DASHBOARD_TOKEN_VALUE;
+#include "secrets.h"
 
 const uint32_t PACKET_MAGIC = 0x50544731; // "PTG1"
 const uint8_t PROTOCOL_VERSION = 1;
-
-const int RSSI_THRESHOLD_DBM = -75;
-const unsigned long PACKET_TIMEOUT_MS = 10000;
-const unsigned long RSSI_FRESH_MS = 3000;
-const unsigned long EMAIL_COOLDOWN_MS = 300000;
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
-const unsigned long BUZZER_SILENCE_MS = 120000;
-
 const uint8_t BUZZER_PIN = D5;
 
 // Keep this struct identical to the pet node.
@@ -127,12 +81,11 @@ PetState petStates[PET_COUNT];
 
 // Structure copied from ESP8266 promiscuous callback metadata.
 struct PromiscuousPacket {
-  RxControl rx_ctrl;
+  EspNowRxControlCompat rx_ctrl;
   uint8_t payload[112];
 };
 
 ESP8266WebServer server(80);
-SMTPSession smtp;
 
 bool espNowReady = false;
 bool wifiReady = false;
@@ -152,6 +105,116 @@ String formatMac(const uint8_t *mac) {
   return String(buffer);
 }
 
+const char *wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL:
+      return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:
+      return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED:
+      return "WL_CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST:
+      return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED:
+      return "WL_DISCONNECTED";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+const char *encryptionName(uint8_t encryptionType) {
+  switch (encryptionType) {
+    case ENC_TYPE_NONE:
+      return "open";
+    case ENC_TYPE_WEP:
+      return "WEP";
+    case ENC_TYPE_TKIP:
+      return "WPA/TKIP";
+    case ENC_TYPE_CCMP:
+      return "WPA2/CCMP";
+    case ENC_TYPE_AUTO:
+      return "auto";
+    default:
+      return "unknown";
+  }
+}
+
+void printHomeNodeIdentity() {
+  Serial.println();
+  Serial.println("----- Home Node Identity -----");
+  Serial.print("Home Node MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("Home Node IP: ");
+  Serial.println(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "not connected yet");
+  Serial.print("Configured WiFi SSID: ");
+  Serial.println(WIFI_SSID_VALUE);
+  Serial.print("WiFi connect timeout: ");
+  Serial.print(WIFI_CONNECT_TIMEOUT_MS_VALUE);
+  Serial.println(" ms");
+  Serial.println("------------------------------");
+}
+
+void printWifiScanResults(bool onlyConfiguredSsid) {
+  if (onlyConfiguredSsid) {
+    Serial.println("Scanning nearby 2.4 GHz WiFi networks for configured SSID...");
+  } else {
+    Serial.println("Initial WiFi scan: nearby 2.4 GHz networks");
+  }
+
+  int networkCount = WiFi.scanNetworks(false, true);
+  if (networkCount < 0) {
+    Serial.print("WiFi scan failed, result code: ");
+    Serial.println(networkCount);
+    return;
+  }
+
+  bool foundConfiguredSsid = false;
+  Serial.print("Networks found: ");
+  Serial.println(networkCount);
+
+  for (int i = 0; i < networkCount; i++) {
+    bool isConfiguredSsid = WiFi.SSID(i) == String(WIFI_SSID_VALUE);
+    if (onlyConfiguredSsid && !isConfiguredSsid) {
+      continue;
+    }
+
+    if (isConfiguredSsid) {
+      foundConfiguredSsid = true;
+    }
+
+    Serial.print(isConfiguredSsid ? "* " : "  ");
+    Serial.print("SSID=\"");
+    Serial.print(WiFi.SSID(i));
+    Serial.print("\", RSSI=");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(" dBm, channel=");
+    Serial.print(WiFi.channel(i));
+    Serial.print(", BSSID=");
+    Serial.print(WiFi.BSSIDstr(i));
+    Serial.print(", encryption=");
+    Serial.println(encryptionName(WiFi.encryptionType(i)));
+  }
+
+  if (!foundConfiguredSsid) {
+    Serial.println("Configured SSID was NOT found in scan results.");
+    Serial.println("Check SSID spelling, 2.4 GHz availability, router range, and hidden-network settings.");
+  }
+
+  WiFi.scanDelete();
+}
+
+void printInitialWifiScan() {
+  printWifiScanResults(false);
+}
+
+void scanForConfiguredWifi() {
+  printWifiScanResults(true);
+}
+
 bool macEquals(const uint8_t *left, const uint8_t *right) {
   return memcmp(left, right, 6) == 0;
 }
@@ -165,40 +228,64 @@ int findPetIndex(const uint8_t *mac) {
   return -1;
 }
 
-void smtpCallback(SMTP_Status status) {
-  Serial.println(status.info());
-  if (status.success()) {
-    Serial.println("Email alert sent successfully.");
-  } else {
-    Serial.println("Email alert failed.");
-  }
-}
-
 bool smtpConfigLooksFilled() {
-  return String(SMTP_HOST) != "smtp.example.com" &&
-         String(SENDER_EMAIL) != "sender@example.com" &&
-         String(SENDER_APP_PASSWORD) != "YOUR_APP_PASSWORD" &&
-         String(RECIPIENT_EMAIL) != "recipient@example.com";
+  return String(SMTP_HOST_VALUE) != "smtp.example.com" &&
+         String(SENDER_EMAIL_VALUE) != "sender@example.com" &&
+         String(SENDER_APP_PASSWORD_VALUE) != "YOUR_APP_PASSWORD" &&
+         String(RECIPIENT_EMAIL_VALUE) != "recipient@example.com";
 }
 
 bool connectToWifi() {
+  printInitialWifiScan();
+
   Serial.println("Connecting Home Node to WiFi...");
+  Serial.print("Target SSID: ");
+  Serial.println(WIFI_SSID_VALUE);
 
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.disconnect();
   delay(50);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_SSID_VALUE, WIFI_PASSWORD_VALUE);
 
   unsigned long startMs = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS) {
+  wl_status_t lastStatus = WiFi.status();
+  Serial.print("Initial WiFi status: ");
+  Serial.print(wifiStatusName(lastStatus));
+  Serial.print(" (");
+  Serial.print(static_cast<int>(lastStatus));
+  Serial.println(")");
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startMs < WIFI_CONNECT_TIMEOUT_MS_VALUE) {
     delay(250);
+    wl_status_t currentStatus = WiFi.status();
+    if (currentStatus != lastStatus) {
+      Serial.println();
+      Serial.print("WiFi status changed: ");
+      Serial.print(wifiStatusName(currentStatus));
+      Serial.print(" (");
+      Serial.print(static_cast<int>(currentStatus));
+      Serial.println(")");
+      lastStatus = currentStatus;
+    }
     Serial.print(".");
   }
   Serial.println();
 
   if (WiFi.status() != WL_CONNECTED) {
+    wl_status_t finalStatus = WiFi.status();
     Serial.println("Home Node WiFi connect failed.");
+    Serial.print("Final WiFi status: ");
+    Serial.print(wifiStatusName(finalStatus));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(finalStatus));
+    Serial.println(")");
+    Serial.print("Home Node MAC for router allow-list checks: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Home Node IP: ");
+    Serial.println(WiFi.localIP().toString());
+    Serial.println("Common causes: wrong password, wrong SSID, 5 GHz-only SSID, weak signal, MAC filtering, or router channel changes.");
+    scanForConfiguredWifi();
     return false;
   }
 
@@ -318,7 +405,7 @@ bool initEspNow() {
 
 bool hasRecentRssiSample(int idx) {
   unsigned long stamp = petStates[idx].lastRssiAtMs;
-  return stamp != 0 && (millis() - stamp) <= RSSI_FRESH_MS;
+  return stamp != 0 && (millis() - stamp) <= RSSI_FRESH_MS_VALUE;
 }
 
 String petStatus(int idx) {
@@ -326,10 +413,10 @@ String petStatus(int idx) {
   if (!s.packetReceived) {
     return "Waiting";
   }
-  if (millis() - s.lastPacketAtMs > PACKET_TIMEOUT_MS) {
+  if (millis() - s.lastPacketAtMs > PACKET_TIMEOUT_MS_VALUE) {
     return "Lost";
   }
-  if (hasRecentRssiSample(idx) && s.lastRssi <= RSSI_THRESHOLD_DBM) {
+  if (hasRecentRssiSample(idx) && s.lastRssi <= RSSI_THRESHOLD_DBM_VALUE) {
     return "Far";
   }
   return "Nearby";
@@ -373,16 +460,82 @@ void updateBuzzerPattern() {
 
 bool emailCooldownActive(int idx) {
   unsigned long stamp = petStates[idx].lastEmailSentAtMs;
-  return stamp != 0 && (millis() - stamp) < EMAIL_COOLDOWN_MS;
+  return stamp != 0 && (millis() - stamp) < EMAIL_COOLDOWN_MS_VALUE;
 }
 
 String emailCooldownState(int idx) {
   unsigned long stamp = petStates[idx].lastEmailSentAtMs;
   if (stamp == 0) return "Ready";
   unsigned long elapsed = millis() - stamp;
-  if (elapsed >= EMAIL_COOLDOWN_MS) return "Ready";
-  unsigned long remainingSeconds = (EMAIL_COOLDOWN_MS - elapsed) / 1000UL;
+  if (elapsed >= EMAIL_COOLDOWN_MS_VALUE) return "Ready";
+  unsigned long remainingSeconds = (EMAIL_COOLDOWN_MS_VALUE - elapsed) / 1000UL;
   return "Cooldown (" + String(remainingSeconds) + "s left)";
+}
+
+String base64Encode(const String &input) {
+  const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String output;
+  int value = 0;
+  int bits = -6;
+
+  for (size_t i = 0; i < input.length(); i++) {
+    value = (value << 8) + static_cast<uint8_t>(input[i]);
+    bits += 8;
+    while (bits >= 0) {
+      output += table[(value >> bits) & 0x3F];
+      bits -= 6;
+    }
+  }
+
+  if (bits > -6) {
+    output += table[((value << 8) >> (bits + 8)) & 0x3F];
+  }
+  while (output.length() % 4) {
+    output += '=';
+  }
+  return output;
+}
+
+int readSmtpCode(BearSSL::WiFiClientSecure &client) {
+  int code = -1;
+  unsigned long startMs = millis();
+
+  while (client.connected() && millis() - startMs < 15000) {
+    if (!client.available()) {
+      delay(10);
+      continue;
+    }
+
+    String line = client.readStringUntil('\n');
+    line.trim();
+    Serial.print("SMTP < ");
+    Serial.println(line);
+
+    if (line.length() >= 3) {
+      code = line.substring(0, 3).toInt();
+      if (line.length() < 4 || line.charAt(3) != '-') {
+        return code;
+      }
+    }
+  }
+
+  return code;
+}
+
+bool smtpCommand(BearSSL::WiFiClientSecure &client, const String &command, int expectedCode) {
+  if (command.length() > 0) {
+    Serial.print("SMTP > ");
+    if (command.startsWith("AUTH") || command.length() > 48) {
+      Serial.println("[redacted]");
+    } else {
+      Serial.println(command);
+    }
+    client.print(command);
+    client.print("\r\n");
+  }
+
+  int code = readSmtpCode(client);
+  return code == expectedCode;
 }
 
 bool sendEmailAlert(int idx, const String &statusText) {
@@ -396,34 +549,20 @@ bool sendEmailAlert(int idx, const String &statusText) {
     return false;
   }
 
-  smtp.callback(smtpCallback);
-
-  ESP_Mail_Session session;
-  session.server.host_name = SMTP_HOST;
-  session.server.port = SMTP_PORT;
-  session.login.email = SENDER_EMAIL;
-  session.login.password = SENDER_APP_PASSWORD;
-  session.login.user_domain = "";
-  session.time.ntp_server = "pool.ntp.org,time.nist.gov";
-  session.time.gmt_offset = SMTP_TIME_GMT_OFFSET;
-  session.time.day_light_offset = 0;
-
   const PetState &s = petStates[idx];
 
-  SMTP_Message message;
-  message.sender.name = "ESP8266 Pet Tracker";
-  message.sender.email = SENDER_EMAIL;
   String subject = "Pet Tracker Alert: ";
   subject += PETS[idx].displayName;
   subject += " is ";
   subject += statusText;
-  message.subject = subject.c_str();
-  message.addRecipient("Owner", RECIPIENT_EMAIL);
 
   String body;
   body += "Pet tracker alert generated by Home Node.\r\n\r\n";
-  body += "Pet: " + String(PETS[idx].displayName) +
-          " (" + String(PETS[idx].petId) + ")\r\n";
+  body += "Pet: ";
+  body += PETS[idx].displayName;
+  body += " (";
+  body += PETS[idx].petId;
+  body += ")\r\n";
   body += "Status: " + statusText + "\r\n";
   body += "MAC: " + formatMac(PETS[idx].mac) + "\r\n";
   body += "RSSI: " + String(s.lastRssi) + " dBm\r\n";
@@ -433,20 +572,60 @@ bool sendEmailAlert(int idx, const String &statusText) {
   body += "Home Node IP: " + homeIpString + "\r\n";
   body += "\r\n";
   body += "This is an approximate RSSI-based alert.\r\n";
-  message.text.content = body.c_str();
-  message.text.charSet = "us-ascii";
-  message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
 
-  Serial.print("Opening SMTP session for ");
+  Serial.print("Opening SMTP SSL connection for ");
   Serial.println(PETS[idx].displayName);
-  if (!smtp.connect(&session)) {
+
+  BearSSL::WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(15000);
+
+  if (!client.connect(SMTP_HOST_VALUE, SMTP_PORT_VALUE)) {
     Serial.println("SMTP connection failed.");
     return false;
   }
 
-  bool sent = MailClient.sendMail(&smtp, &message, true);
-  smtp.closeSession();
-  return sent;
+  bool ok = true;
+  ok = ok && smtpCommand(client, "", 220);
+  ok = ok && smtpCommand(client, "EHLO esp8266-pet-tracker", 250);
+  ok = ok && smtpCommand(client, "AUTH LOGIN", 334);
+  ok = ok && smtpCommand(client, base64Encode(SENDER_EMAIL_VALUE), 334);
+  ok = ok && smtpCommand(client, base64Encode(SENDER_APP_PASSWORD_VALUE), 235);
+  ok = ok && smtpCommand(client, "MAIL FROM:<" + String(SENDER_EMAIL_VALUE) + ">", 250);
+
+  if (ok) {
+    client.print("RCPT TO:<");
+    client.print(RECIPIENT_EMAIL_VALUE);
+    client.print(">\r\n");
+    int rcptCode = readSmtpCode(client);
+    ok = rcptCode == 250 || rcptCode == 251;
+  }
+
+  ok = ok && smtpCommand(client, "DATA", 354);
+  if (ok) {
+    client.print("From: ESP8266 Pet Tracker <");
+    client.print(SENDER_EMAIL_VALUE);
+    client.print(">\r\n");
+    client.print("To: Owner <");
+    client.print(RECIPIENT_EMAIL_VALUE);
+    client.print(">\r\n");
+    client.print("Subject: ");
+    client.print(subject);
+    client.print("\r\n");
+    client.print("MIME-Version: 1.0\r\n");
+    client.print("Content-Type: text/plain; charset=us-ascii\r\n");
+    client.print("Content-Transfer-Encoding: 7bit\r\n");
+    client.print("\r\n");
+    client.print(body);
+    client.print("\r\n.\r\n");
+    ok = readSmtpCode(client) == 250;
+  }
+
+  smtpCommand(client, "QUIT", 221);
+  client.stop();
+
+  Serial.println(ok ? "Email alert sent successfully." : "Email alert failed.");
+  return ok;
 }
 
 void maybeSendAlertEmail(int idx, const String &statusText) {
@@ -512,7 +691,7 @@ void handleRoot() {
   html += "<tr><td>WiFi channel</td><td>" + String(wifiChannel) + "</td></tr>";
   html += "</table>";
   html += "<form class='silence' method='POST' action='/silence'>";
-  if (strlen(DASHBOARD_TOKEN) > 0) {
+  if (strlen(DASHBOARD_TOKEN_VALUE) > 0) {
     html += "<input type='password' name='token' placeholder='token' required> ";
   }
   html += "<button class='silence' type='submit'>Silence buzzer for 2 minutes</button>";
@@ -580,13 +759,13 @@ void handleJson() {
 }
 
 void handleSilence() {
-  if (strlen(DASHBOARD_TOKEN) > 0) {
-    if (!server.hasArg("token") || server.arg("token") != String(DASHBOARD_TOKEN)) {
+  if (strlen(DASHBOARD_TOKEN_VALUE) > 0) {
+    if (!server.hasArg("token") || server.arg("token") != String(DASHBOARD_TOKEN_VALUE)) {
       server.send(403, "text/plain", "Invalid token");
       return;
     }
   }
-  buzzerSilencedUntilMs = millis() + BUZZER_SILENCE_MS;
+  buzzerSilencedUntilMs = millis() + BUZZER_SILENCE_MS_VALUE;
   writeBuzzer(false);
   Serial.println("Buzzer silenced from dashboard.");
   server.sendHeader("Location", "/");
@@ -628,6 +807,10 @@ void setup() {
   Serial.println();
   Serial.println("=== Home Node Boot ===");
 
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  printHomeNodeIdentity();
+
   pinMode(BUZZER_PIN, OUTPUT);
   writeBuzzer(false);
 
@@ -662,7 +845,17 @@ void loop() {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
+    wl_status_t droppedStatus = WiFi.status();
     Serial.println("WiFi dropped. Restarting Home Node for recovery.");
+    Serial.print("Dropped WiFi status: ");
+    Serial.print(wifiStatusName(droppedStatus));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(droppedStatus));
+    Serial.println(")");
+    Serial.print("Home Node MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Home Node last known IP: ");
+    Serial.println(homeIpString);
     stopPromiscuousSniffer();
     ESP.restart();
   }
