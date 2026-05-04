@@ -13,6 +13,8 @@
 // Main behavior tuning.
 #define WIFI_CONNECT_TIMEOUT_MS_VALUE 15000UL
 #define SEND_INTERVAL_MS_VALUE 2000UL
+#define ESPNOW_CHANNEL_VALUE 0
+#define ESPNOW_REINIT_AFTER_FAILS_VALUE 5
 
 // Battery reading is disabled until A0 is wired through a safe divider.
 #define USE_ADC_BATTERY_READING_VALUE false

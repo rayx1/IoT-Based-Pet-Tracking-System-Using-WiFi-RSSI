@@ -95,6 +95,10 @@ bool emailConfigured = true;
 unsigned long lastStatusLogAtMs = 0;
 unsigned long lastBuzzerToggleAtMs = 0;
 unsigned long buzzerSilencedUntilMs = 0;
+unsigned long wifiDisconnectedSinceMs = 0;
+unsigned long lastWifiRecoveryLogAtMs = 0;
+unsigned long lastWifiIdleStatusLogAtMs = 0;
+unsigned long lastEspNowHealthCheckAtMs = 0;
 uint8_t wifiChannel = 0;
 String homeIpString = "0.0.0.0";
 
@@ -235,8 +239,19 @@ bool smtpConfigLooksFilled() {
          String(RECIPIENT_EMAIL_VALUE) != "recipient@example.com";
 }
 
-bool connectToWifi() {
-  printInitialWifiScan();
+bool hasNonZeroLocalIp() {
+  IPAddress ip = WiFi.localIP();
+  return ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0;
+}
+
+bool hasLastKnownIp() {
+  return homeIpString.length() > 0 && homeIpString != "0.0.0.0";
+}
+
+bool connectToWifi(bool runInitialScan = true) {
+  if (runInitialScan) {
+    printInitialWifiScan();
+  }
 
   Serial.println("Connecting Home Node to WiFi...");
   Serial.print("Target SSID: ");
@@ -334,6 +349,11 @@ void ICACHE_FLASH_ATTR promiscuousCallback(uint8_t *buffer, uint16_t length) {
 }
 
 void startPromiscuousSniffer() {
+  if (!ENABLE_RSSI_SNIFFER_VALUE) {
+    Serial.println("Promiscuous RSSI sniffer disabled by ENABLE_RSSI_SNIFFER_VALUE.");
+    return;
+  }
+
   wifi_promiscuous_enable(0);
   wifi_set_promiscuous_rx_cb(promiscuousCallback);
   wifi_promiscuous_enable(1);
@@ -341,6 +361,10 @@ void startPromiscuousSniffer() {
 }
 
 void stopPromiscuousSniffer() {
+  if (!ENABLE_RSSI_SNIFFER_VALUE) {
+    return;
+  }
+
   wifi_promiscuous_enable(0);
 }
 
@@ -392,15 +416,138 @@ void onDataReceived(uint8_t *senderMac, uint8_t *incomingData, uint8_t len) {
 }
 
 bool initEspNow() {
+  esp_now_deinit();
   if (esp_now_init() != 0) {
     Serial.println("ESP-NOW init failed on Home Node.");
     return false;
   }
 
-  esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
   esp_now_register_recv_cb(onDataReceived);
+  uint8_t peerChannel = ESPNOW_CHANNEL_VALUE == 0 ? wifiChannel : ESPNOW_CHANNEL_VALUE;
+
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    if (esp_now_add_peer(const_cast<uint8_t *>(PETS[i].mac), ESP_NOW_ROLE_COMBO, peerChannel, NULL, 0) != 0) {
+      Serial.print("Failed to add ESP-NOW peer for ");
+      Serial.print(PETS[i].displayName);
+      Serial.print(" @ ");
+      Serial.println(formatMac(PETS[i].mac));
+      return false;
+    }
+  }
+
   Serial.println("ESP-NOW initialized on Home Node.");
+  Serial.print("ESP-NOW self role: COMBO, peer channel: ");
+  Serial.println(peerChannel);
+  Serial.print("Home Node ESP-NOW MAC: ");
+  Serial.println(WiFi.macAddress());
   return true;
+}
+
+void checkEspNowReceiverHealth() {
+  if (!ENABLE_RSSI_SNIFFER_VALUE) {
+    return;
+  }
+
+  if (millis() - lastEspNowHealthCheckAtMs < ESPNOW_RX_HEALTH_MS_VALUE) {
+    return;
+  }
+  lastEspNowHealthCheckAtMs = millis();
+
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    bool hasFreshSignal = hasRecentRssiSample(i);
+    bool hasNoDecodedPacket = !petStates[i].packetReceived;
+    if (!hasFreshSignal || !hasNoDecodedPacket) {
+      continue;
+    }
+
+    Serial.print("ESP-NOW health: signal frames visible for ");
+    Serial.print(PETS[i].displayName);
+    Serial.println(", but no valid payload packet decoded yet.");
+    Serial.println("Reinitializing ESP-NOW receive callback.");
+    espNowReady = initEspNow();
+    return;
+  }
+}
+
+bool handleWifiRecovery() {
+  wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED) {
+    wifiDisconnectedSinceMs = 0;
+    lastWifiRecoveryLogAtMs = 0;
+    return true;
+  }
+
+  unsigned long nowMs = millis();
+  if (status == WL_IDLE_STATUS && hasLastKnownIp()) {
+    wifiDisconnectedSinceMs = 0;
+    lastWifiRecoveryLogAtMs = 0;
+    if (nowMs - lastWifiIdleStatusLogAtMs >= 10000) {
+      lastWifiIdleStatusLogAtMs = nowMs;
+      Serial.println("WiFi reports WL_IDLE_STATUS after successful connection. Treating connection as usable.");
+      Serial.print("Home Node last known IP: ");
+      Serial.println(homeIpString);
+      Serial.print("Current local IP readback: ");
+      Serial.println(WiFi.localIP().toString());
+      Serial.print("Home Node MAC: ");
+      Serial.println(WiFi.macAddress());
+    }
+    return true;
+  }
+
+  if (wifiDisconnectedSinceMs == 0) {
+    wifiDisconnectedSinceMs = nowMs;
+    lastWifiRecoveryLogAtMs = 0;
+    Serial.println("WiFi not connected. Starting recovery grace period.");
+    Serial.print("Current WiFi status: ");
+    Serial.print(wifiStatusName(status));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(status));
+    Serial.println(")");
+    Serial.print("Home Node MAC: ");
+    Serial.println(WiFi.macAddress());
+    Serial.print("Home Node last known IP: ");
+    Serial.println(homeIpString);
+  }
+
+  if (nowMs - lastWifiRecoveryLogAtMs >= 2000) {
+    lastWifiRecoveryLogAtMs = nowMs;
+    Serial.print("WiFi recovery waiting. Status=");
+    Serial.print(wifiStatusName(status));
+    Serial.print(" (");
+    Serial.print(static_cast<int>(status));
+    Serial.print("), elapsed=");
+    Serial.print(nowMs - wifiDisconnectedSinceMs);
+    Serial.print("/");
+    Serial.print(WIFI_RECOVERY_GRACE_MS_VALUE);
+    Serial.println(" ms");
+  }
+
+  if (nowMs - wifiDisconnectedSinceMs < WIFI_RECOVERY_GRACE_MS_VALUE) {
+    return false;
+  }
+
+  Serial.println("WiFi recovery grace expired. Reconnecting without immediate reboot...");
+  stopPromiscuousSniffer();
+  wifiReady = connectToWifi(false);
+  if (wifiReady) {
+    wifiDisconnectedSinceMs = 0;
+    lastWifiRecoveryLogAtMs = 0;
+    startPromiscuousSniffer();
+    if (!espNowReady) {
+      espNowReady = initEspNow();
+    }
+    Serial.println("WiFi recovered successfully.");
+    return true;
+  }
+
+  Serial.println("WiFi reconnect failed after grace period. Restarting Home Node for clean recovery.");
+  Serial.print("Home Node MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("Home Node last known IP: ");
+  Serial.println(homeIpString);
+  ESP.restart();
+  return false;
 }
 
 bool hasRecentRssiSample(int idx) {
@@ -425,12 +572,19 @@ String petStatus(int idx) {
 // Returns the most urgent status across all pets: "Lost" > "Far" > anything else.
 String overallUrgency() {
   bool anyFar = false;
+  bool anyNearby = false;
+  bool anyWaiting = false;
   for (uint8_t i = 0; i < PET_COUNT; i++) {
     String s = petStatus(i);
     if (s == "Lost") return "Lost";
     if (s == "Far") anyFar = true;
+    if (s == "Nearby") anyNearby = true;
+    if (s == "Waiting") anyWaiting = true;
   }
-  return anyFar ? "Far" : "Nearby";
+  if (anyFar) return "Far";
+  if (anyNearby) return "Nearby";
+  if (anyWaiting) return "Waiting";
+  return "Waiting";
 }
 
 bool buzzerSilenced() {
@@ -444,7 +598,7 @@ void writeBuzzer(bool enabled) {
 
 void updateBuzzerPattern() {
   String urgency = overallUrgency();
-  if (buzzerSilenced() || urgency == "Nearby") {
+  if (buzzerSilenced() || urgency == "Nearby" || urgency == "Waiting") {
     writeBuzzer(false);
     return;
   }
@@ -844,24 +998,15 @@ void loop() {
     return;
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    wl_status_t droppedStatus = WiFi.status();
-    Serial.println("WiFi dropped. Restarting Home Node for recovery.");
-    Serial.print("Dropped WiFi status: ");
-    Serial.print(wifiStatusName(droppedStatus));
-    Serial.print(" (");
-    Serial.print(static_cast<int>(droppedStatus));
-    Serial.println(")");
-    Serial.print("Home Node MAC: ");
-    Serial.println(WiFi.macAddress());
-    Serial.print("Home Node last known IP: ");
-    Serial.println(homeIpString);
-    stopPromiscuousSniffer();
-    ESP.restart();
+  if (!handleWifiRecovery()) {
+    updateBuzzerPattern();
+    delay(10);
+    return;
   }
 
   server.handleClient();
 
+  checkEspNowReceiverHealth();
   updateBuzzerPattern();
 
   for (uint8_t i = 0; i < PET_COUNT; i++) {
