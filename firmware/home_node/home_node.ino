@@ -45,9 +45,31 @@ extern "C" {
 #define RECIPIENT_EMAIL_VALUE "recipient@example.com"
 #endif
 
-#ifndef PET_NODE_MAC_BYTES
-// Replace this with the MAC printed by the Pet Node sketch.
-#define PET_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}
+// SMTP DATE-header offset. Units depend on the ESP-Mail-Client version.
+// Older builds expect seconds (e.g. 19800 = UTC+5:30 IST), newer builds expect hours.
+// Set whatever your installed version expects; default 0 = UTC.
+#ifndef SMTP_TIME_GMT_OFFSET_VALUE
+#define SMTP_TIME_GMT_OFFSET_VALUE 0
+#endif
+
+// Pet roster. Add one entry per pet node. Each entry is:
+//   { {mac bytes}, "PROTOCOL_PET_ID", "Display Name" }
+// PROTOCOL_PET_ID must match the pet node's PET_ID_VALUE exactly (used for packet validation).
+// Display Name is shown on the dashboard. Use the same string as PROTOCOL_PET_ID if you do not care.
+//
+// Example with two pets:
+//   #define PET_NODE_LIST \
+//     { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Bella" }, \
+//     { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCD}, "PET-002", "Max"   }
+#ifndef PET_NODE_LIST
+#define PET_NODE_LIST \
+  { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Pet 1" }
+#endif
+
+// Optional dashboard token. If defined and non-empty, /silence requires
+// the matching value as a "token" form field. Leave undefined to disable.
+#ifndef DASHBOARD_TOKEN_VALUE
+#define DASHBOARD_TOKEN_VALUE ""
 #endif
 
 const char *WIFI_SSID = WIFI_SSID_VALUE;
@@ -57,19 +79,20 @@ const int SMTP_PORT = SMTP_PORT_VALUE;
 const char *SENDER_EMAIL = SENDER_EMAIL_VALUE;
 const char *SENDER_APP_PASSWORD = SENDER_APP_PASSWORD_VALUE;
 const char *RECIPIENT_EMAIL = RECIPIENT_EMAIL_VALUE;
-uint8_t PET_NODE_MAC[] = PET_NODE_MAC_BYTES;
+const float SMTP_TIME_GMT_OFFSET = SMTP_TIME_GMT_OFFSET_VALUE;
+const char *DASHBOARD_TOKEN = DASHBOARD_TOKEN_VALUE;
 
 const uint32_t PACKET_MAGIC = 0x50544731; // "PTG1"
 const uint8_t PROTOCOL_VERSION = 1;
 
 const int RSSI_THRESHOLD_DBM = -75;
 const unsigned long PACKET_TIMEOUT_MS = 10000;
+const unsigned long RSSI_FRESH_MS = 3000;
 const unsigned long EMAIL_COOLDOWN_MS = 300000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000;
 const unsigned long BUZZER_SILENCE_MS = 120000;
 
 const uint8_t BUZZER_PIN = D5;
-const char *EXPECTED_PET_ID = "PET-001";
 
 // Keep this struct identical to the pet node.
 struct PetPacket {
@@ -81,6 +104,27 @@ struct PetPacket {
   uint32_t uptimeSeconds;
 };
 
+struct PetConfig {
+  uint8_t mac[6];
+  const char *petId;
+  const char *displayName;
+};
+
+const PetConfig PETS[] = { PET_NODE_LIST };
+constexpr uint8_t PET_COUNT = sizeof(PETS) / sizeof(PETS[0]);
+
+struct PetState {
+  PetPacket lastPacket;
+  bool packetReceived;
+  unsigned long lastPacketAtMs;
+  volatile int lastRssi;
+  volatile unsigned long lastRssiAtMs;
+  unsigned long lastEmailSentAtMs;
+  bool alertConditionActive;
+};
+
+PetState petStates[PET_COUNT];
+
 // Structure copied from ESP8266 promiscuous callback metadata.
 struct PromiscuousPacket {
   RxControl rx_ctrl;
@@ -90,21 +134,12 @@ struct PromiscuousPacket {
 ESP8266WebServer server(80);
 SMTPSession smtp;
 
-volatile int lastCapturedRssi = -127;
-volatile bool rssiUpdated = false;
-volatile unsigned long lastPromiscPacketAtMs = 0;
-
-PetPacket lastPacket;
-bool packetReceived = false;
 bool espNowReady = false;
 bool wifiReady = false;
 bool buzzerOutputHigh = false;
-bool alertConditionActive = false;
 bool emailConfigured = true;
 
-unsigned long lastPacketAtMs = 0;
 unsigned long lastStatusLogAtMs = 0;
-unsigned long lastEmailSentAtMs = 0;
 unsigned long lastBuzzerToggleAtMs = 0;
 unsigned long buzzerSilencedUntilMs = 0;
 uint8_t wifiChannel = 0;
@@ -121,9 +156,17 @@ bool macEquals(const uint8_t *left, const uint8_t *right) {
   return memcmp(left, right, 6) == 0;
 }
 
+int findPetIndex(const uint8_t *mac) {
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    if (macEquals(PETS[i].mac, mac)) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 void smtpCallback(SMTP_Status status) {
   Serial.println(status.info());
-
   if (status.success()) {
     Serial.println("Email alert sent successfully.");
   } else {
@@ -166,10 +209,19 @@ bool connectToWifi() {
   Serial.println(homeIpString);
   Serial.print("Home Node MAC: ");
   Serial.println(WiFi.macAddress());
-  Serial.print("Expected Pet Node MAC: ");
-  Serial.println(formatMac(PET_NODE_MAC));
   Serial.print("Home Node WiFi channel: ");
   Serial.println(wifiChannel);
+  Serial.print("Tracking ");
+  Serial.print(PET_COUNT);
+  Serial.println(" pet(s):");
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    Serial.print("  - ");
+    Serial.print(PETS[i].displayName);
+    Serial.print(" (");
+    Serial.print(PETS[i].petId);
+    Serial.print(") @ ");
+    Serial.println(formatMac(PETS[i].mac));
+  }
   return true;
 }
 
@@ -179,18 +231,19 @@ void ICACHE_FLASH_ATTR promiscuousCallback(uint8_t *buffer, uint16_t length) {
   }
 
   PromiscuousPacket *packet = reinterpret_cast<PromiscuousPacket *>(buffer);
-  const uint8_t *sourceMac = packet->payload + 10;
-
   // ESP8266 ESP-NOW receive callbacks do not expose RSSI. The promiscuous
-  // callback sees the WiFi frame metadata, so filter it by the expected
-  // transmitter MAC before using the RSSI value.
-  if (!macEquals(sourceMac, PET_NODE_MAC)) {
+  // callback exposes the WiFi frame metadata (rx_ctrl) plus the raw 802.11
+  // header. Bytes payload[10..15] are addr2 (the transmitter address) for
+  // the data and management frame layouts ESP-NOW uses, so we filter on it
+  // before trusting the RSSI value.
+  const uint8_t *sourceMac = packet->payload + 10;
+  int idx = findPetIndex(sourceMac);
+  if (idx < 0) {
     return;
   }
 
-  lastCapturedRssi = packet->rx_ctrl.rssi;
-  lastPromiscPacketAtMs = millis();
-  rssiUpdated = true;
+  petStates[idx].lastRssi = packet->rx_ctrl.rssi;
+  petStates[idx].lastRssiAtMs = millis();
 }
 
 void startPromiscuousSniffer() {
@@ -204,21 +257,24 @@ void stopPromiscuousSniffer() {
   wifi_promiscuous_enable(0);
 }
 
-bool isValidPacket(const PetPacket &packet) {
+bool isValidPacket(const PetPacket &packet, int idx) {
   return packet.magic == PACKET_MAGIC &&
          packet.protocolVersion == PROTOCOL_VERSION &&
-         strncmp(packet.petId, EXPECTED_PET_ID, sizeof(packet.petId)) == 0;
+         strncmp(packet.petId, PETS[idx].petId, sizeof(packet.petId)) == 0;
 }
 
 void onDataReceived(uint8_t *senderMac, uint8_t *incomingData, uint8_t len) {
-  if (!macEquals(senderMac, PET_NODE_MAC)) {
-    Serial.print("Ignoring packet from unexpected MAC: ");
+  int idx = findPetIndex(senderMac);
+  if (idx < 0) {
+    Serial.print("Ignoring packet from unknown MAC: ");
     Serial.println(formatMac(senderMac));
     return;
   }
 
   if (len != sizeof(PetPacket)) {
-    Serial.print("Unexpected packet size: ");
+    Serial.print("Unexpected packet size from ");
+    Serial.print(formatMac(senderMac));
+    Serial.print(": ");
     Serial.println(len);
     return;
   }
@@ -226,32 +282,26 @@ void onDataReceived(uint8_t *senderMac, uint8_t *incomingData, uint8_t len) {
   PetPacket incomingPacket;
   memcpy(&incomingPacket, incomingData, sizeof(incomingPacket));
 
-  if (!isValidPacket(incomingPacket)) {
-    Serial.println("Rejected packet with invalid magic, protocol version, or pet ID.");
+  if (!isValidPacket(incomingPacket, idx)) {
+    Serial.print("Rejected packet for ");
+    Serial.print(PETS[idx].displayName);
+    Serial.println(" (bad magic, version, or pet ID mismatch).");
     return;
   }
 
-  memcpy(&lastPacket, &incomingPacket, sizeof(lastPacket));
-  lastPacketAtMs = millis();
-  packetReceived = true;
+  petStates[idx].lastPacket = incomingPacket;
+  petStates[idx].packetReceived = true;
+  petStates[idx].lastPacketAtMs = millis();
 
   Serial.print("Packet received from ");
-  Serial.println(formatMac(senderMac));
-  Serial.print("petId: ");
-  Serial.println(lastPacket.petId);
-  Serial.print("counter: ");
-  Serial.println(lastPacket.packetCounter);
-  Serial.print("batteryVoltage: ");
-  Serial.println(lastPacket.batteryVoltage, 2);
-  Serial.print("uptimeSeconds: ");
-  Serial.println(lastPacket.uptimeSeconds);
-
-  if (rssiUpdated) {
-    Serial.print("Filtered RSSI: ");
-    Serial.println(lastCapturedRssi);
-  } else {
-    Serial.println("Filtered RSSI not updated yet.");
-  }
+  Serial.print(PETS[idx].displayName);
+  Serial.print(" (");
+  Serial.print(formatMac(senderMac));
+  Serial.print(") counter=");
+  Serial.print(incomingPacket.packetCounter);
+  Serial.print(" battery=");
+  Serial.print(incomingPacket.batteryVoltage, 2);
+  Serial.println(" V");
 }
 
 bool initEspNow() {
@@ -266,36 +316,34 @@ bool initEspNow() {
   return true;
 }
 
-String emailCooldownState() {
-  unsigned long elapsed = millis() - lastEmailSentAtMs;
-  bool cooldownActive = lastEmailSentAtMs != 0 && elapsed < EMAIL_COOLDOWN_MS;
-  if (!cooldownActive) {
-    return "Ready";
-  }
-
-  unsigned long remainingSeconds = (EMAIL_COOLDOWN_MS - elapsed) / 1000UL;
-  return "Cooldown (" + String(remainingSeconds) + "s left)";
+bool hasRecentRssiSample(int idx) {
+  unsigned long stamp = petStates[idx].lastRssiAtMs;
+  return stamp != 0 && (millis() - stamp) <= RSSI_FRESH_MS;
 }
 
-bool hasRecentRssiSample() {
-  return rssiUpdated && (millis() - lastPromiscPacketAtMs) <= 3000;
-}
-
-String currentPetStatus() {
-  if (!packetReceived) {
+String petStatus(int idx) {
+  const PetState &s = petStates[idx];
+  if (!s.packetReceived) {
     return "Waiting";
   }
-
-  unsigned long ageMs = millis() - lastPacketAtMs;
-  if (ageMs > PACKET_TIMEOUT_MS) {
+  if (millis() - s.lastPacketAtMs > PACKET_TIMEOUT_MS) {
     return "Lost";
   }
-
-  if (hasRecentRssiSample() && lastCapturedRssi <= RSSI_THRESHOLD_DBM) {
+  if (hasRecentRssiSample(idx) && s.lastRssi <= RSSI_THRESHOLD_DBM) {
     return "Far";
   }
-
   return "Nearby";
+}
+
+// Returns the most urgent status across all pets: "Lost" > "Far" > anything else.
+String overallUrgency() {
+  bool anyFar = false;
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    String s = petStatus(i);
+    if (s == "Lost") return "Lost";
+    if (s == "Far") anyFar = true;
+  }
+  return anyFar ? "Far" : "Nearby";
 }
 
 bool buzzerSilenced() {
@@ -307,14 +355,15 @@ void writeBuzzer(bool enabled) {
   digitalWrite(BUZZER_PIN, enabled ? HIGH : LOW);
 }
 
-void updateBuzzerPattern(const String &statusText) {
-  if (buzzerSilenced() || statusText == "Nearby" || statusText == "Waiting") {
+void updateBuzzerPattern() {
+  String urgency = overallUrgency();
+  if (buzzerSilenced() || urgency == "Nearby") {
     writeBuzzer(false);
     return;
   }
 
   unsigned long nowMs = millis();
-  unsigned long intervalMs = statusText == "Lost" ? 200 : 700;
+  unsigned long intervalMs = urgency == "Lost" ? 200 : 700;
 
   if (nowMs - lastBuzzerToggleAtMs >= intervalMs) {
     lastBuzzerToggleAtMs = nowMs;
@@ -322,7 +371,21 @@ void updateBuzzerPattern(const String &statusText) {
   }
 }
 
-bool sendEmailAlert(const String &statusText) {
+bool emailCooldownActive(int idx) {
+  unsigned long stamp = petStates[idx].lastEmailSentAtMs;
+  return stamp != 0 && (millis() - stamp) < EMAIL_COOLDOWN_MS;
+}
+
+String emailCooldownState(int idx) {
+  unsigned long stamp = petStates[idx].lastEmailSentAtMs;
+  if (stamp == 0) return "Ready";
+  unsigned long elapsed = millis() - stamp;
+  if (elapsed >= EMAIL_COOLDOWN_MS) return "Ready";
+  unsigned long remainingSeconds = (EMAIL_COOLDOWN_MS - elapsed) / 1000UL;
+  return "Cooldown (" + String(remainingSeconds) + "s left)";
+}
+
+bool sendEmailAlert(int idx, const String &statusText) {
   if (!wifiReady) {
     Serial.println("Skip email: WiFi unavailable.");
     return false;
@@ -342,24 +405,31 @@ bool sendEmailAlert(const String &statusText) {
   session.login.password = SENDER_APP_PASSWORD;
   session.login.user_domain = "";
   session.time.ntp_server = "pool.ntp.org,time.nist.gov";
-  session.time.gmt_offset = 19800;
+  session.time.gmt_offset = SMTP_TIME_GMT_OFFSET;
   session.time.day_light_offset = 0;
+
+  const PetState &s = petStates[idx];
 
   SMTP_Message message;
   message.sender.name = "ESP8266 Pet Tracker";
   message.sender.email = SENDER_EMAIL;
-  String subject = "Pet Tracker Alert: " + statusText;
+  String subject = "Pet Tracker Alert: ";
+  subject += PETS[idx].displayName;
+  subject += " is ";
+  subject += statusText;
   message.subject = subject.c_str();
   message.addRecipient("Owner", RECIPIENT_EMAIL);
 
   String body;
   body += "Pet tracker alert generated by Home Node.\r\n\r\n";
+  body += "Pet: " + String(PETS[idx].displayName) +
+          " (" + String(PETS[idx].petId) + ")\r\n";
   body += "Status: " + statusText + "\r\n";
-  body += "Pet ID: " + String(lastPacket.petId) + "\r\n";
-  body += "RSSI: " + String(lastCapturedRssi) + " dBm\r\n";
-  body += "Last packet age: " + String(millis() - lastPacketAtMs) + " ms\r\n";
-  body += "Packet counter: " + String(lastPacket.packetCounter) + "\r\n";
-  body += "Battery: " + String(lastPacket.batteryVoltage, 2) + " V\r\n";
+  body += "MAC: " + formatMac(PETS[idx].mac) + "\r\n";
+  body += "RSSI: " + String(s.lastRssi) + " dBm\r\n";
+  body += "Last packet age: " + String(s.packetReceived ? millis() - s.lastPacketAtMs : 0) + " ms\r\n";
+  body += "Packet counter: " + String(s.lastPacket.packetCounter) + "\r\n";
+  body += "Battery: " + String(s.lastPacket.batteryVoltage, 2) + " V\r\n";
   body += "Home Node IP: " + homeIpString + "\r\n";
   body += "\r\n";
   body += "This is an approximate RSSI-based alert.\r\n";
@@ -367,7 +437,8 @@ bool sendEmailAlert(const String &statusText) {
   message.text.charSet = "us-ascii";
   message.text.transfer_encoding = Content_Transfer_Encoding::enc_7bit;
 
-  Serial.println("Opening SMTP session...");
+  Serial.print("Opening SMTP session for ");
+  Serial.println(PETS[idx].displayName);
   if (!smtp.connect(&session)) {
     Serial.println("SMTP connection failed.");
     return false;
@@ -378,19 +449,15 @@ bool sendEmailAlert(const String &statusText) {
   return sent;
 }
 
-void maybeSendAlertEmail(const String &statusText) {
-  if (!(statusText == "Far" || statusText == "Lost")) {
+void maybeSendAlertEmail(int idx, const String &statusText) {
+  if (statusText != "Far" && statusText != "Lost") {
     return;
   }
-
-  unsigned long elapsed = millis() - lastEmailSentAtMs;
-  bool cooldownActive = lastEmailSentAtMs != 0 && elapsed < EMAIL_COOLDOWN_MS;
-  if (cooldownActive) {
+  if (emailCooldownActive(idx)) {
     return;
   }
-
-  if (sendEmailAlert(statusText)) {
-    lastEmailSentAtMs = millis();
+  if (sendEmailAlert(idx, statusText)) {
+    petStates[idx].lastEmailSentAtMs = millis();
   }
 }
 
@@ -398,74 +465,136 @@ String jsonBool(bool value) {
   return value ? "true" : "false";
 }
 
-void handleRoot() {
-  String statusText = currentPetStatus();
-  unsigned long packetAge = packetReceived ? millis() - lastPacketAtMs : 0;
+String jsonEscape(const char *value) {
+  String out;
+  out.reserve(strlen(value) + 2);
+  for (const char *p = value; *p; p++) {
+    char c = *p;
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if ((uint8_t)c < 0x20) {
+      char buf[8];
+      snprintf(buf, sizeof(buf), "\\u%04x", c);
+      out += buf;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
 
+void handleRoot() {
   String html;
+  html.reserve(2048 + 512 * PET_COUNT);
   html += "<!DOCTYPE html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   html += "<meta http-equiv='refresh' content='3'>";
   html += "<title>ESP8266 Pet Tracker</title>";
   html += "<style>";
   html += "body{font-family:Arial,sans-serif;background:#f4f7fb;color:#1f2937;margin:0;padding:24px;}";
-  html += ".card{max-width:760px;margin:0 auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,0.08);}";
-  html += "h1{margin-top:0;}table{width:100%;border-collapse:collapse;}td{padding:10px;border-bottom:1px solid #e5e7eb;}";
-  html += ".status{font-weight:bold;font-size:1.2rem;}a.button{display:inline-block;margin-top:16px;background:#1f2937;color:#fff;padding:10px 14px;border-radius:6px;text-decoration:none;}";
+  html += ".card{max-width:760px;margin:0 auto 16px auto;background:#fff;border-radius:8px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,0.08);}";
+  html += "h1,h2{margin-top:0;}table{width:100%;border-collapse:collapse;}td{padding:10px;border-bottom:1px solid #e5e7eb;vertical-align:top;}";
+  html += ".status{font-weight:bold;font-size:1.2rem;}";
+  html += ".s-Nearby{color:#047857;}.s-Far{color:#b45309;}.s-Lost{color:#b91c1c;}.s-Waiting{color:#6b7280;}";
+  html += "form.silence{margin-top:16px;}button.silence{background:#1f2937;color:#fff;padding:10px 14px;border:0;border-radius:6px;font-size:1rem;cursor:pointer;}";
   html += "code{background:#eef2ff;padding:2px 6px;border-radius:6px;}";
-  html += "</style></head><body><div class='card'>";
+  html += "</style></head><body>";
+
+  html += "<div class='card'>";
   html += "<h1>IoT Pet Tracker Dashboard</h1>";
-  html += "<p>JSON API: <code>/json</code></p>";
+  html += "<p>Tracking " + String(PET_COUNT) + " pet(s). JSON API: <code>/json</code></p>";
   html += "<table>";
-  html += "<tr><td>Pet status</td><td class='status'>" + statusText + "</td></tr>";
-  html += "<tr><td>Pet ID</td><td>" + String(packetReceived ? lastPacket.petId : EXPECTED_PET_ID) + "</td></tr>";
-  html += "<tr><td>Pet Node MAC</td><td>" + formatMac(PET_NODE_MAC) + "</td></tr>";
-  html += "<tr><td>RSSI</td><td>" + String(lastCapturedRssi) + " dBm</td></tr>";
-  html += "<tr><td>RSSI sample</td><td>" + String(hasRecentRssiSample() ? "Recent" : "Waiting") + "</td></tr>";
-  html += "<tr><td>Last packet age</td><td>" + String(packetAge) + " ms</td></tr>";
-  html += "<tr><td>Packet counter</td><td>" + String(packetReceived ? lastPacket.packetCounter : 0) + "</td></tr>";
-  html += "<tr><td>Battery</td><td>" + String(packetReceived ? lastPacket.batteryVoltage : 0, 2) + " V</td></tr>";
+  html += "<tr><td>Overall urgency</td><td class='status s-" + overallUrgency() + "'>" + overallUrgency() + "</td></tr>";
   html += "<tr><td>Buzzer state</td><td>" + String(buzzerOutputHigh ? "ON" : "OFF") + "</td></tr>";
   html += "<tr><td>Buzzer silence</td><td>" + String(buzzerSilenced() ? "Active" : "Inactive") + "</td></tr>";
-  html += "<tr><td>Email cooldown</td><td>" + emailCooldownState() + "</td></tr>";
   html += "<tr><td>Home Node IP</td><td>" + homeIpString + "</td></tr>";
   html += "<tr><td>WiFi channel</td><td>" + String(wifiChannel) + "</td></tr>";
   html += "</table>";
-  html += "<a class='button' href='/silence'>Silence buzzer for 2 minutes</a>";
-  html += "</div></body></html>";
+  html += "<form class='silence' method='POST' action='/silence'>";
+  if (strlen(DASHBOARD_TOKEN) > 0) {
+    html += "<input type='password' name='token' placeholder='token' required> ";
+  }
+  html += "<button class='silence' type='submit'>Silence buzzer for 2 minutes</button>";
+  html += "</form>";
+  html += "</div>";
+
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    const PetState &s = petStates[i];
+    String statusText = petStatus(i);
+    unsigned long packetAge = s.packetReceived ? millis() - s.lastPacketAtMs : 0;
+
+    html += "<div class='card'>";
+    html += "<h2>" + String(PETS[i].displayName) + "</h2>";
+    html += "<table>";
+    html += "<tr><td>Status</td><td class='status s-" + statusText + "'>" + statusText + "</td></tr>";
+    html += "<tr><td>Pet ID</td><td>" + String(PETS[i].petId) + "</td></tr>";
+    html += "<tr><td>MAC</td><td>" + formatMac(PETS[i].mac) + "</td></tr>";
+    html += "<tr><td>RSSI</td><td>" + String(s.lastRssi) + " dBm</td></tr>";
+    html += "<tr><td>RSSI sample</td><td>" + String(hasRecentRssiSample(i) ? "Recent" : "Stale") + "</td></tr>";
+    html += "<tr><td>Last packet age</td><td>" + String(packetAge) + " ms</td></tr>";
+    html += "<tr><td>Packet counter</td><td>" + String(s.packetReceived ? s.lastPacket.packetCounter : 0) + "</td></tr>";
+    html += "<tr><td>Battery</td><td>" + String(s.packetReceived ? s.lastPacket.batteryVoltage : 0, 2) + " V</td></tr>";
+    html += "<tr><td>Email cooldown</td><td>" + emailCooldownState(i) + "</td></tr>";
+    html += "</table>";
+    html += "</div>";
+  }
+
+  html += "</body></html>";
 
   server.send(200, "text/html", html);
 }
 
 void handleJson() {
-  String statusText = currentPetStatus();
-  unsigned long packetAge = packetReceived ? millis() - lastPacketAtMs : 0;
-  bool cooldownActive = lastEmailSentAtMs != 0 && (millis() - lastEmailSentAtMs) < EMAIL_COOLDOWN_MS;
-
-  String json = "{";
-  json += "\"petId\":\"" + String(packetReceived ? lastPacket.petId : EXPECTED_PET_ID) + "\",";
-  json += "\"status\":\"" + statusText + "\",";
-  json += "\"rssi\":" + String(lastCapturedRssi) + ",";
-  json += "\"rssiRecent\":" + jsonBool(hasRecentRssiSample()) + ",";
-  json += "\"lastPacketAgeMs\":" + String(packetAge) + ",";
-  json += "\"packetCounter\":" + String(packetReceived ? lastPacket.packetCounter : 0) + ",";
-  json += "\"batteryVoltage\":" + String(packetReceived ? lastPacket.batteryVoltage : 0, 2) + ",";
+  String json;
+  json.reserve(512 + 256 * PET_COUNT);
+  json += "{";
+  json += "\"homeNodeIp\":\"" + homeIpString + "\",";
+  json += "\"wifiChannel\":" + String(wifiChannel) + ",";
+  json += "\"overallUrgency\":\"" + overallUrgency() + "\",";
   json += "\"buzzerOn\":" + jsonBool(buzzerOutputHigh) + ",";
   json += "\"buzzerSilenced\":" + jsonBool(buzzerSilenced()) + ",";
-  json += "\"emailCooldownActive\":" + jsonBool(cooldownActive) + ",";
-  json += "\"petNodeMac\":\"" + formatMac(PET_NODE_MAC) + "\",";
-  json += "\"homeNodeIp\":\"" + homeIpString + "\"";
-  json += "}";
+  json += "\"pets\":[";
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    const PetState &s = petStates[i];
+    String statusText = petStatus(i);
+    unsigned long packetAge = s.packetReceived ? millis() - s.lastPacketAtMs : 0;
+
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"petId\":\"" + jsonEscape(PETS[i].petId) + "\",";
+    json += "\"displayName\":\"" + jsonEscape(PETS[i].displayName) + "\",";
+    json += "\"mac\":\"" + formatMac(PETS[i].mac) + "\",";
+    json += "\"status\":\"" + statusText + "\",";
+    json += "\"rssi\":" + String(s.lastRssi) + ",";
+    json += "\"rssiRecent\":" + jsonBool(hasRecentRssiSample(i)) + ",";
+    json += "\"lastPacketAgeMs\":" + String(packetAge) + ",";
+    json += "\"packetCounter\":" + String(s.packetReceived ? s.lastPacket.packetCounter : 0) + ",";
+    json += "\"batteryVoltage\":" + String(s.packetReceived ? s.lastPacket.batteryVoltage : 0, 2) + ",";
+    json += "\"emailCooldownActive\":" + jsonBool(emailCooldownActive(i));
+    json += "}";
+  }
+  json += "]}";
 
   server.send(200, "application/json", json);
 }
 
 void handleSilence() {
+  if (strlen(DASHBOARD_TOKEN) > 0) {
+    if (!server.hasArg("token") || server.arg("token") != String(DASHBOARD_TOKEN)) {
+      server.send(403, "text/plain", "Invalid token");
+      return;
+    }
+  }
   buzzerSilencedUntilMs = millis() + BUZZER_SILENCE_MS;
   writeBuzzer(false);
   Serial.println("Buzzer silenced from dashboard.");
   server.sendHeader("Location", "/");
   server.send(303, "text/plain", "");
+}
+
+void handleSilenceWrongMethod() {
+  server.send(405, "text/plain", "Use POST");
 }
 
 void handleNotFound() {
@@ -475,10 +604,23 @@ void handleNotFound() {
 void startWebServer() {
   server.on("/", handleRoot);
   server.on("/json", handleJson);
-  server.on("/silence", handleSilence);
+  server.on("/silence", HTTP_POST, handleSilence);
+  server.on("/silence", HTTP_GET, handleSilenceWrongMethod);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Web server started on port 80.");
+}
+
+void initPetStates() {
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    memset(&petStates[i].lastPacket, 0, sizeof(PetPacket));
+    petStates[i].packetReceived = false;
+    petStates[i].lastPacketAtMs = 0;
+    petStates[i].lastRssi = -127;
+    petStates[i].lastRssiAtMs = 0;
+    petStates[i].lastEmailSentAtMs = 0;
+    petStates[i].alertConditionActive = false;
+  }
 }
 
 void setup() {
@@ -488,6 +630,8 @@ void setup() {
 
   pinMode(BUZZER_PIN, OUTPUT);
   writeBuzzer(false);
+
+  initPetStates();
 
   emailConfigured = smtpConfigLooksFilled();
   if (!emailConfigured) {
@@ -525,31 +669,43 @@ void loop() {
 
   server.handleClient();
 
-  String statusText = currentPetStatus();
-  updateBuzzerPattern(statusText);
+  updateBuzzerPattern();
 
-  bool newAlertState = statusText == "Far" || statusText == "Lost";
-  if (newAlertState && !alertConditionActive) {
-    Serial.print("Alert condition entered: ");
-    Serial.println(statusText);
+  for (uint8_t i = 0; i < PET_COUNT; i++) {
+    String statusText = petStatus(i);
+    bool inAlert = statusText == "Far" || statusText == "Lost";
+    if (inAlert && !petStates[i].alertConditionActive) {
+      Serial.print("Alert condition entered for ");
+      Serial.print(PETS[i].displayName);
+      Serial.print(": ");
+      Serial.println(statusText);
+    }
+    if (inAlert) {
+      maybeSendAlertEmail(i, statusText);
+    }
+    petStates[i].alertConditionActive = inAlert;
   }
-  if (newAlertState) {
-    maybeSendAlertEmail(statusText);
-  }
-  alertConditionActive = newAlertState;
 
   if (millis() - lastStatusLogAtMs >= 2000) {
     lastStatusLogAtMs = millis();
-    Serial.print("Status=");
-    Serial.print(statusText);
-    Serial.print(", RSSI=");
-    Serial.print(lastCapturedRssi);
-    Serial.print(", RSSIRecent=");
-    Serial.print(hasRecentRssiSample() ? "yes" : "no");
-    Serial.print(", PacketAgeMs=");
-    Serial.print(packetReceived ? millis() - lastPacketAtMs : 0);
+    Serial.print("Overall=");
+    Serial.print(overallUrgency());
     Serial.print(", Buzzer=");
     Serial.println(buzzerOutputHigh ? "ON" : "OFF");
+    for (uint8_t i = 0; i < PET_COUNT; i++) {
+      const PetState &s = petStates[i];
+      Serial.print("  ");
+      Serial.print(PETS[i].displayName);
+      Serial.print(": status=");
+      Serial.print(petStatus(i));
+      Serial.print(", rssi=");
+      Serial.print(s.lastRssi);
+      Serial.print(" (");
+      Serial.print(hasRecentRssiSample(i) ? "fresh" : "stale");
+      Serial.print("), packetAge=");
+      Serial.print(s.packetReceived ? millis() - s.lastPacketAtMs : 0);
+      Serial.println(" ms");
+    }
   }
 
   if (!espNowReady) {

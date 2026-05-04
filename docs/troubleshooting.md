@@ -9,19 +9,34 @@
 
 ## Pet node not detected
 
-- Verify the Home Node MAC was copied correctly into `pet_node.ino`.
-- Verify the Pet Node MAC was copied correctly into `home_node.ino`.
-- Confirm both boards connect to the same WiFi router SSID.
-- Check that both boards report the same WiFi channel in Serial Monitor.
+- Verify the Home Node MAC was copied correctly into each `pet_node` config.
+- Verify each Pet Node MAC was added to `PET_NODE_LIST` on the Home Node.
+- Confirm all boards connect to the same WiFi router SSID.
+- Check that all boards report the same WiFi channel in Serial Monitor.
 - Move the boards closer together during first testing.
 
-## RSSI not updating
+## "Rejected packet ... pet ID mismatch"
 
-- Wait for at least one valid ESP-NOW packet from the pet node.
-- Confirm the home node logs show both packet reception and RSSI capture.
-- Make sure `PET_NODE_MAC_BYTES` matches the Pet Node MAC exactly.
-- If RSSI stays at `-127`, packets may be arriving without matching promiscuous frame capture.
-- If packets arrive but RSSI does not update, temporarily test with the boards close together and confirm the Pet Node MAC filter.
+- The MAC matches an entry in `PET_NODE_LIST`, but the pet node's `PET_ID_VALUE` does not equal the `PROTOCOL_PET_ID` you wrote in that entry.
+- Open the offending pet node sketch, set `PET_ID_VALUE` to the same string used in the home node entry, and re-upload.
+
+## "Ignoring packet from unknown MAC"
+
+- A pet node is sending but its MAC is not in `PET_NODE_LIST` on the home node.
+- Add an entry for that MAC, re-upload the home node, or fix the typo in the existing entry.
+
+## RSSI not updating for one specific pet
+
+- Confirm that pet's MAC byte sequence in `PET_NODE_LIST` exactly matches what the pet's Serial Monitor prints (case-insensitive, but every byte must match).
+- The dashboard shows `RSSI sample: Stale` when no matching frame has been seen in the last 3 seconds.
+- If only one of several pets shows stale RSSI while others update, the entry for that pet has the wrong MAC bytes.
+
+## RSSI stalls for ALL pets after long uptime
+
+- ESP-NOW + STA + promiscuous sniffer + WebServer share one radio. Some firmware combinations destabilise after hours of load.
+- Try power-cycling the home node.
+- If the issue is reproducible, reduce dashboard refresh rate (the meta-refresh in the HTML is currently 3 s) or reduce per-pet `SEND_INTERVAL_MS` on the pet nodes to lighten the air.
+- Last-resort: comment out `startPromiscuousSniffer()` and accept losing the RSSI signal in exchange for stability.
 
 ## Email not sending
 
@@ -29,6 +44,12 @@
 - Confirm your WiFi internet access is working.
 - Verify the email library is installed correctly.
 - Read the Serial Monitor SMTP error text.
+
+## Email timestamps are wildly wrong
+
+- `SMTP_TIME_GMT_OFFSET_VALUE` units depend on your installed `ESP-Mail-Client` version.
+- Older builds expect seconds (`19800` = IST). Newer builds expect hours (`5.5` = IST).
+- Set it to `0` for UTC if the wrong unit causes nonsensical dates.
 
 ## Gmail authentication error
 
@@ -43,17 +64,28 @@
 - Open the exact IP shown in Serial Monitor.
 - If needed, reboot the Home Node and try again.
 
+## Silence button does nothing / returns 405
+
+- The endpoint is now `POST /silence`. Hitting it via a plain `GET` (e.g. typing the URL in the browser bar) returns `405 Use POST`.
+- Use the dashboard's silence form. If you scripted a curl call, use `curl -X POST http://HOME_IP/silence`.
+- If you set `DASHBOARD_TOKEN_VALUE`, you must also pass `-d "token=YOUR_TOKEN"`.
+
 ## Buzzer always ON
 
 - Increase `RSSI_THRESHOLD_DBM` because the current threshold may be too strict.
 - Confirm the buzzer wiring is connected to `D5` and `GND`.
-- Check if packet timeout is being triggered because the pet node is not sending.
+- Check if any pet's packet timeout is being triggered.
 - Check whether the dashboard silence state is active.
-- Some buzzer modules are active-low; if needed, invert the buzzer logic in code.
+- Some buzzer modules are active-low; if needed, invert the buzzer logic in `writeBuzzer`.
+
+## Buzzer pattern with multiple pets
+
+- The buzzer reflects the **most urgent pet**: any pet `Lost` produces fast beeps; otherwise any pet `Far` produces slow beeps.
+- A single silence press silences the buzzer for 2 minutes regardless of how many pets are alerting.
 
 ## Wrong WiFi channel
 
-- Both boards must lock to the same router channel.
-- Make sure both connect to the same SSID before ESP-NOW exchange.
+- All boards must lock to the same router channel.
+- Make sure all boards connect to the same SSID before ESP-NOW exchange.
 - If your router uses band steering or changing channels, test with a fixed 2.4 GHz channel.
-- Reboot both nodes after router channel changes.
+- Reboot all nodes after router channel changes.

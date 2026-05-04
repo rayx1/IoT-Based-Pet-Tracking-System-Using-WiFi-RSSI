@@ -1,17 +1,19 @@
 # iot-pet-tracker-espnow-rssi
 
-Two-node IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based proximity detection, buzzer alerts, SMTP email warnings, and a built-in web dashboard.
+IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based proximity detection, buzzer alerts, SMTP email warnings, and a built-in web dashboard. Supports **multiple pet nodes** tracked from a single home node.
 
 ## Features
 
-- `Pet Node` sends validated ESP-NOW packets with pet ID, packet counter, uptime, and battery voltage field
-- `Home Node` receives packets only from the configured Pet Node MAC
-- RSSI samples are filtered by Pet Node MAC to reduce interference from unrelated WiFi traffic
-- Buzzer alert uses slow beeps for `Far` and faster beeps for `Lost`
-- Dashboard includes a temporary buzzer silence control
-- SMTP email alert with cooldown to avoid spam
-- Web dashboard on port `80`
-- JSON API endpoint at `/json`
+- One Home Node supervises **N pet nodes** (one collar per pet)
+- Pet Node sends validated ESP-NOW packets with pet ID, packet counter, uptime, and battery voltage field
+- Home Node accepts packets only from the configured pet roster MACs
+- RSSI samples are filtered per-pet by source MAC to reduce interference from unrelated WiFi traffic
+- Per-pet status: `Nearby`, `Far`, `Lost`, `Waiting`
+- Buzzer alert reflects the most urgent pet: slow beep for any `Far`, faster beep when any pet is `Lost`
+- Per-pet SMTP email cooldown so each pet alerts independently without spam
+- Dashboard renders one card per pet plus a global control panel
+- Dashboard `Silence` control is a POST endpoint with optional shared-token guard
+- JSON API at `/json` returns the full roster as an array
 - Serial debug logs for both nodes
 - Placeholder configuration section at the top of each sketch, with optional ignored `secrets.h`
 - Safe fallback behavior for WiFi or ESP-NOW setup failures
@@ -25,31 +27,33 @@ Two-node IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based 
                  +---------+--------+
                            |
             locks channel  |  locks channel
-                           |
+              (per pet)    |
       +--------------------+--------------------+
-      |                                         |
-      v                                         v
-+------------------+                    +----------------------+
-| Pet Node         |   ESP-NOW packets  | Home Node            |
-| NodeMCU ESP8266  | -----------------> | NodeMCU ESP8266      |
-| Collar mounted   |                    | Buzzer on D5         |
-| Sends pet data   |                    | Dashboard + Email    |
-+------------------+                    +----------+-----------+
-                                                   |
-                                                   v
-                                         +------------------+
-                                         | User Browser     |
-                                         | / and SMTP inbox |
-                                         +------------------+
+      |                    |                    |
+      v                    v                    v
++------------------+ +------------------+ +----------------------+
+| Pet Node 1       | | Pet Node 2       | | Home Node            |
+| NodeMCU ESP8266  | | NodeMCU ESP8266  | | NodeMCU ESP8266      |
+| Collar mounted   | | Collar mounted   | | Buzzer on D5         |
+| Sends pet data   | | Sends pet data   | | Dashboard + Email    |
++--------+---------+ +--------+---------+ +----------+-----------+
+         | ESP-NOW           | ESP-NOW              |
+         +-------------------+--------------------->|
+                                                    v
+                                          +------------------+
+                                          | User Browser     |
+                                          | / and SMTP inbox |
+                                          +------------------+
 ```
 
 ## Hardware Required
 
-- 2 x NodeMCU ESP8266 development boards
-- 1 x active buzzer
+- 1 x NodeMCU ESP8266 for the Home Node
+- 1 x NodeMCU ESP8266 **per pet** for Pet Nodes
+- 1 x active buzzer (Home Node)
 - Jumper wires
 - USB cable for each board
-- Optional battery pack for the pet node
+- Optional battery pack for each pet node
 
 ## Wiring
 
@@ -59,7 +63,7 @@ Two-node IoT pet tracker built with NodeMCU ESP8266 boards, ESP-NOW, RSSI-based 
 | `GND` | Active buzzer ground pin | Shared ground |
 | `VIN` or USB | Power input | Use stable 5V USB or regulated supply |
 
-See full notes in [docs/wiring.md](/F:/GOOGLE%20Antigravity/BCA/iot-pet-tracker-espnow-rssi/docs/wiring.md).
+See full notes in [docs/wiring.md](docs/wiring.md).
 
 ## Software / Libraries Required
 
@@ -97,21 +101,41 @@ iot-pet-tracker-espnow-rssi/
 1. Install Arduino IDE.
 2. Install the ESP8266 board package from Board Manager.
 3. Install the `ESP Mail Client` library from Library Manager.
-4. Upload the Pet Node once and copy its MAC from Serial Monitor.
-5. Paste the Pet Node MAC into the Home Node `PET_NODE_MAC_BYTES` config.
+4. **For each pet node**: edit `PET_ID_VALUE` to a unique string (`PET-001`, `PET-002`, ...), upload, copy its MAC from Serial Monitor.
+5. Add an entry per pet to the Home Node `PET_NODE_LIST` (MAC, pet ID, display name).
 6. Upload the Home Node and copy its MAC from Serial Monitor.
-7. Paste the Home Node MAC into the Pet Node `HOME_NODE_MAC_BYTES` config.
-8. Upload the Pet Node again.
+7. Paste the Home Node MAC into each pet node's `HOME_NODE_MAC_BYTES`.
+8. Upload each pet node again.
 9. Open the Home Node IP shown in Serial Monitor in a browser.
 
-Detailed guide: [docs/setup.md](/F:/GOOGLE%20Antigravity/BCA/iot-pet-tracker-espnow-rssi/docs/setup.md)
+Detailed guide: [docs/setup.md](docs/setup.md).
 
-## How to Find the Home Node MAC Address
+## Configuring Multiple Pets
 
-1. Upload the Home Node sketch.
+The Home Node holds a roster macro `PET_NODE_LIST`. Each entry binds one MAC to a protocol pet ID and a friendly display name:
+
+```cpp
+#define PET_NODE_LIST \
+  { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}, "PET-001", "Bella" }, \
+  { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCD}, "PET-002", "Max"   }, \
+  { {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCE}, "PET-003", "Coco"  }
+```
+
+Rules:
+
+- Every pet node sketch must set `PET_ID_VALUE` to the same string used in the home node entry for that MAC.
+- MAC bytes in the home node entry must match the MAC printed by that pet node's Serial Monitor.
+- Add entries by appending lines (with trailing `\` continuation). The home node sizes its arrays automatically.
+- Each pet has its own status, RSSI, buzzer-influence, and email cooldown.
+
+If a pet node's `PET_ID_VALUE` does not match the entry for its MAC, the home node logs `Rejected packet ... pet ID mismatch`.
+
+## How to Find a Node's MAC Address
+
+1. Upload the sketch.
 2. Open Serial Monitor at `115200` baud.
 3. Wait for the startup logs.
-4. Copy the MAC printed as `Home Node MAC`.
+4. Copy the printed MAC.
 
 Example:
 
@@ -119,47 +143,26 @@ Example:
 Home Node MAC: 84:F3:EB:12:34:56
 ```
 
-## How to Paste the Home Node MAC into Pet Node Code
-
-Find this section in `pet_node.ino` or `firmware/pet_node/secrets.h`:
-
-```cpp
-#define HOME_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0x12, 0x34, 0x56}
-```
-
-Replace the six hex values with the Home Node MAC from Serial Monitor.
-
-## How to Paste the Pet Node MAC into Home Node Code
-
-Find this section in `home_node.ino` or `firmware/home_node/secrets.h`:
-
-```cpp
-#define PET_NODE_MAC_BYTES {0x84, 0xF3, 0xEB, 0xAA, 0xBB, 0xCC}
-```
-
-Replace the six hex values with the Pet Node MAC from Serial Monitor. This is used for packet filtering and RSSI filtering.
-
 ## Optional secrets.h Workflow
 
 Each firmware folder includes a `secrets.example.h`.
 
 1. Duplicate `secrets.example.h` as `secrets.h`.
-2. Edit `secrets.h` with your WiFi, SMTP, and MAC values.
+2. Edit `secrets.h` with your WiFi, SMTP, MAC, and pet roster values.
 3. Keep `secrets.h` private. It is already ignored by `.gitignore`.
 
 ## How to Configure Email SMTP
 
-Edit these placeholders at the top of `home_node.ino`:
+Edit these placeholders at the top of `home_node.ino` (or in `secrets.h`):
 
-- `WIFI_SSID`
-- `WIFI_PASSWORD`
-- `SMTP_HOST`
-- `SMTP_PORT`
-- `SENDER_EMAIL`
-- `SENDER_APP_PASSWORD`
-- `RECIPIENT_EMAIL`
-
-If using `secrets.h`, edit the matching `*_VALUE` macros instead.
+- `WIFI_SSID_VALUE`
+- `WIFI_PASSWORD_VALUE`
+- `SMTP_HOST_VALUE`
+- `SMTP_PORT_VALUE`
+- `SENDER_EMAIL_VALUE`
+- `SENDER_APP_PASSWORD_VALUE`
+- `RECIPIENT_EMAIL_VALUE`
+- `SMTP_TIME_GMT_OFFSET_VALUE`
 
 Example for Gmail SMTP:
 
@@ -168,11 +171,20 @@ Example for Gmail SMTP:
 - Sender email: your Gmail address
 - App password: 16-character Gmail App Password
 
-## Gmail App Password Note
+### SMTP timezone offset
+
+`SMTP_TIME_GMT_OFFSET_VALUE` controls the DATE header that ESP-Mail-Client writes. The unit depends on the installed library version:
+
+- Older builds expect **seconds** (`19800` = UTC+5:30 IST)
+- Newer builds expect **hours** (`5.5` = UTC+5:30 IST)
+
+If unsure, leave it at `0`. SMTP servers usually rewrite the timestamp anyway.
+
+### Gmail App Password Note
 
 For Gmail, regular account passwords usually will not work. Use:
 
-1. Google account with 2-Step Verification enabled
+1. A Google account with 2-Step Verification enabled
 2. An App Password generated in Google Account security settings
 
 Do not store your real password in public repositories.
@@ -187,14 +199,10 @@ http://192.168.1.50/
 
 The dashboard shows:
 
-- Pet status: `Nearby`, `Far`, `Lost`, or `Waiting`
-- Latest RSSI
-- Last packet age
-- Packet counter
-- Buzzer state
-- Buzzer silence state
-- Email cooldown state
-- Home Node IP
+- **Global card**: overall urgency, buzzer state, buzzer silence state, home IP, WiFi channel, silence button (POST form)
+- **One card per pet**: status, pet ID, MAC, RSSI, RSSI freshness, last packet age, packet counter, battery, email cooldown
+
+The `Silence` button uses an HTML POST form so a stray prefetch or browser preview cannot trigger it. To require a shared token, set `DASHBOARD_TOKEN_VALUE` to a non-empty string in `secrets.h`; the dashboard will then render a token input field and reject submissions without the matching value.
 
 ## JSON Endpoint Example
 
@@ -204,21 +212,41 @@ Open:
 http://192.168.1.50/json
 ```
 
-Example response:
+Example response with two pets:
 
 ```json
 {
-  "petId": "PET-001",
-  "status": "Nearby",
-  "rssi": -61,
-  "lastPacketAgeMs": 842,
-  "packetCounter": 128,
-  "batteryVoltage": 4.00,
-  "buzzerOn": false,
+  "homeNodeIp": "192.168.1.50",
+  "wifiChannel": 6,
+  "overallUrgency": "Far",
+  "buzzerOn": true,
   "buzzerSilenced": false,
-  "emailCooldownActive": false,
-  "petNodeMac": "84:F3:EB:AA:BB:CC",
-  "homeNodeIp": "192.168.1.50"
+  "pets": [
+    {
+      "petId": "PET-001",
+      "displayName": "Bella",
+      "mac": "84:F3:EB:AA:BB:CC",
+      "status": "Nearby",
+      "rssi": -61,
+      "rssiRecent": true,
+      "lastPacketAgeMs": 842,
+      "packetCounter": 128,
+      "batteryVoltage": 4.00,
+      "emailCooldownActive": false
+    },
+    {
+      "petId": "PET-002",
+      "displayName": "Max",
+      "mac": "84:F3:EB:AA:BB:CD",
+      "status": "Far",
+      "rssi": -82,
+      "rssiRecent": true,
+      "lastPacketAgeMs": 1500,
+      "packetCounter": 73,
+      "batteryVoltage": 3.92,
+      "emailCooldownActive": true
+    }
+  ]
 }
 ```
 
@@ -231,6 +259,8 @@ Example response:
 - If alerts happen too late, raise the threshold to something like `-70`
 - Tune based on walls, floors, and interference in your house
 
+The same threshold currently applies to all pets. Per-pet thresholds can be added by extending `PetConfig` if you need them.
+
 ## Limitations of RSSI Tracking
 
 - RSSI is affected by walls, body blocking, reflections, and interference
@@ -238,12 +268,14 @@ Example response:
 - Different board placement angles can change readings
 - This project is best for rough proximity detection, not exact location tracking
 - Filtered RSSI improves stability, but it is still not a precise distance measurement
+- ESP-NOW + STA + promiscuous sniffer + WebServer all run on a single radio. Some firmware combinations are sensitive to load; if RSSI updates stall after long uptime, see [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Future Improvements
 
 - GPS module for outdoor location reporting
 - Mobile app notification
 - Battery monitoring with real ADC scaling
+- Per-pet RSSI threshold and per-pet display color
 - MQTT dashboard integration
 - Weatherproof collar enclosure design
 
